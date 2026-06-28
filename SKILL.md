@@ -19,6 +19,10 @@ metadata:
 - 解决问题：按入场日期和开盘价自动判断止盈、止损、强平，以及单票仓位上限控制
 - 使用对象：交易 agent / 人工辅助决策 / Alpha 信号
 
+## 维护者
+- duanyong <hiduan@qq.com>
+- 上游组织：QuantSkills (https://github.com/quantskills)
+
 ## ⚠️ 免责声明
 
 - **仅供研究与教育用途**：本 skill 仅为量化交易研究工具，不构成任何形式的投资建议、理财建议或交易推荐。
