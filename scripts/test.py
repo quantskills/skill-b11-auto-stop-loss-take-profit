@@ -618,7 +618,7 @@ def test_dep_error_message_mentions_install():
 
 
 # ============================================================
-# 生产产物：trade.parquet 缓存
+# production/trade.parquet 缓存
 # ============================================================
 
 def test_parquet_load_when_present_and_covers_today():
@@ -722,7 +722,7 @@ def test_calendar_cache_real_singleton_logic():
 
 
 # ============================================================
-# 生产产物 API：inspect_calendar / refresh_calendar（agent 侧）
+# production API：inspect_calendar / refresh_calendar（agent 侧）
 # ============================================================
 
 def test_inspect_calendar_missing():
@@ -1170,7 +1170,7 @@ if __name__ == "__main__":
     test("env缺失抛 RuntimeError", test_dep_missing_env_raises_runtime_error)
     test("引导消息含 pip install / env / export", test_dep_error_message_mentions_install)
 
-    print("\n---- 生产产物：trade.parquet 缓存 ----")
+    print("\n---- production/trade.parquet 缓存 ----")
     test("parquet 覆盖 today → 读盘", test_parquet_load_when_present_and_covers_today)
     test("parquet 不存在 → None 触发回退", test_parquet_returns_none_when_missing)
     test("parquet 过期 → None 触发回退", test_parquet_returns_none_when_stale)

@@ -138,16 +138,16 @@ if not r["in_range"]:
 ### 交易日历规则
 
 - **唯一来源**：`TradingCalendar.from_panda_data(entry_date, today)` → `panda_data.get_trade_cal`
-- **读盘优先**：若 `生产产物/trade.parquet` 存在且覆盖 today，直接读盘；否则实时拉取
+- **读盘优先**：若 `production/trade.parquet` 存在且覆盖 today，直接读盘；否则实时拉取
 - 首次调用自动 `_ensure_panda_logged_in()`（读 env → `init_token`）
 - 后续调用命中模块级 `_PANDA_LOGIN_DONE = True` 与 `_CALENDAR_CACHE` 单例，不重复登录/构造
 - 语义：entry 当天 = 第 0 个交易日；`holding_trading_days==1` 为「次日」；`>=2` 触发强平
 
-### 生产产物：trade.parquet 缓存
+### production/trade.parquet 缓存
 
 | 项 | 值 |
 |---|---|
-| 路径 | `生产产物/trade.parquet`（相对 build.py 的 `../生产产物/`） |
+| 路径 | `production/trade.parquet`（仓库根，与 `scripts/` 同级） |
 | 生成命令 | `python3 scripts/build_calendar.py` |
 | 默认覆盖 | 今天-3年 到 今天+1年（~971 交易日 / ~19 KB snappy） |
 | Schema | 与 `panda_data.get_trade_cal` 一致；`build.py` 只用 `nature_date` 列 |

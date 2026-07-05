@@ -60,7 +60,7 @@ setx PANDA_PASSWORD "<your_password>"
 python3 scripts/build_calendar.py
 ```
 
-生成 `生产产物/trade.parquet`（默认覆盖 今天-3 年 到 今天+1 年，~19KB），后续调用优先读该文件、跳过实时 panda_data 请求。文件过期或缺失时自动回退到实时拉取。
+生成 `production/trade.parquet`（默认覆盖 今天-3 年 到 今天+1 年，~19KB），后续调用优先读该文件、跳过实时 panda_data 请求。文件过期或缺失时自动回退到实时拉取。
 
 ### 凭据获取
 panda_data 账号需向 PandaAI 数据服务申请；未持有账号请联系上游数据服务方。
@@ -190,13 +190,13 @@ results = run([pos1, pos2, pos3])
 
 ## 是否需要生产结果
 - 是否生成 `数据库.parquet`：**是（混合型）**
-- 生产产物：`生产产物/trade.parquet` — A股交易日历缓存
+- 输出产物：`production/trade.parquet` — A股交易日历缓存
 
-### 生产产物 trade.parquet
+### production/trade.parquet
 
 **用途**：`build.py` 运行时优先读该文件构造 `TradingCalendar`，避免高频调用 `panda_data.get_trade_cal`。文件缺失或过期（最晚 `nature_date < today`）时自动回退到实时拉取，不影响功能。
 
-**存放路径**：`src/build/build-b11-auto-stop-loss-take-profit/生产产物/trade.parquet`
+**存放路径**：仓库根 `production/trade.parquet`（与 `scripts/` 同级）。
 
 **默认覆盖范围**：今天-3 年 到 今天+1 年（约 971 个交易日，snappy 压缩 ~19 KB）。
 

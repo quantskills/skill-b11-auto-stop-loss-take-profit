@@ -2,7 +2,7 @@
 
 当需要对 A 股和期货持仓做自动止盈止损与仓位管理时，使用此 skill。支持次日高开止盈（+5%）、次日低开止损（-3%）、持仓满 2 交易日强平、单票名义仓位上限（>10%）减仓，输出标准 8 字段调仓指令。
 
-> 本版本为对 52/100 验收版的**增强修复**，全面落地 6 项缺陷改进（E1–E6），**v2 已升级为混合型 BUILD**——生产产物 `production/trade.parquet` 提供本地交易日历缓存，agent 侧新增 `inspect_calendar()` / `refresh_calendar()` 自主决策 API。
+> 本版本为对 52/100 验收版的**增强修复**，全面落地 6 项缺陷改进（E1–E6），**v2 已升级为混合型 BUILD**——`production/trade.parquet` 提供本地交易日历缓存，agent 侧新增 `inspect_calendar()` / `refresh_calendar()` 自主决策 API。
 > **v3 追加**：新增 `check_date_coverage(start_date, end_date=None)` 一键查询 API——agent 拿到任意日期或回测区间，一次调用即返回「是否在日历覆盖范围内 + 缺口 + 扩展建议 + 可直接执行的 refresh 命令」。
 
 ---
@@ -206,7 +206,7 @@ order = run({
 
 1. **交易日历硬依赖 panda_data**：删除 `config["calendar"]` / `pos["trade_days"]` / `config["trade_days"]` / `pos["holding_trading_days"]` 四个入口，唯一来源 = `panda_data.get_trade_cal`（消除口径分歧风险）。
 2. **自动 env 登录**：`build.py` 首次调用交易日历时自动读 `PANDA_USERNAME` / `PANDA_PASSWORD` 并调 `init_token`；凭据缺失抛 `RuntimeError` 含引导链接。
-3. **新增 `production/trade.parquet` 生产产物**：本 BUILD 从纯调用型升级为**混合型**——本地 parquet 缓存作为交易日历的持久层，避免每次调用都走网络。
+3. **新增 `production/trade.parquet` 缓存产物**：本 BUILD 从纯调用型升级为**混合型**——本地 parquet 缓存作为交易日历的持久层，避免每次调用都走网络。
 4. **新增独立初始化脚本 `scripts/build_calendar.py`**：拉取今天−3年至今天+1年的交易日历，`snappy` 压缩写入 parquet 缓存（~18.5KB / 971 交易日）。
 5. **新增 agent 侧公开 API**：`inspect_calendar()`（只读探查）+ `refresh_calendar(force=False)`（按需刷新），供 agent 自主决策日历生命周期。
 6. **完整 schema 文档 + Agent 更新 SOP**：`SKILL.md` 详细列出 parquet 5 列 schema、日期格式约定、agent 更新四步流程、7 种触发场景决策表。

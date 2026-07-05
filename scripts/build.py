@@ -132,7 +132,7 @@ def _resolve_multiplier(code, multiplier=None):
 #   export PANDA_PASSWORD=your_password
 #
 # 加速与离线：可先运行 `python3 scripts/build_calendar.py` 生成
-# `生产产物/trade.parquet`（默认覆盖 今天-3年..今天+1年），运行时优先读该文件；
+# `production/trade.parquet`（默认覆盖 今天-3年..今天+1年），运行时优先读该文件；
 # 未找到或过期（最晚交易日 < today）时自动回退到实时 panda_data.get_trade_cal。
 #
 # 缓存策略：TradingCalendar 单例进程内复用（_CALENDAR_CACHE），避免 batch_manage 重复 IO。
@@ -140,10 +140,10 @@ def _resolve_multiplier(code, multiplier=None):
 import os as _os
 from pathlib import Path as _Path
 
-# 生产产物 trade.parquet 相对本文件的位置
-# 本文件位置: .../开发产物/scripts/build.py
-# 目标位置:   .../生产产物/trade.parquet  (与「开发产物/」同级)
-_TRADE_PARQUET_PATH = _Path(__file__).resolve().parent.parent.parent / "生产产物" / "trade.parquet"
+# 交易日历缓存文件位置：与本 scripts/ 目录并列的 production/trade.parquet
+# 本文件:  <skill_root>/scripts/build.py
+# 目标:    <skill_root>/production/trade.parquet
+_TRADE_PARQUET_PATH = _Path(__file__).resolve().parent.parent / "production" / "trade.parquet"
 
 _PANDA_LOGIN_DONE = False   # 模块级登录状态标记，避免重复 init_token
 _CALENDAR_CACHE = None      # 模块级 TradingCalendar 单例（parquet 或实时拉取，缓存首个成功结果）
@@ -223,7 +223,7 @@ def inspect_calendar(parquet_path=None):
     只读探查 trade.parquet 状态，供 agent 决定是否需要 refresh_calendar。
 
     Args:
-        parquet_path: 自定义 parquet 位置；None 用默认 生产产物/trade.parquet
+        parquet_path: 自定义 parquet 位置；None 用默认 production/trade.parquet
 
     Returns: dict
         {
@@ -372,7 +372,7 @@ def check_date_coverage(start_date, end_date=None, parquet_path=None):
     Args:
         start_date: 日期字符串 YYYY-MM-DD（单点查询）；或区间起点
         end_date:   区间终点 YYYY-MM-DD；None 时视为单点查询（等价 end_date=start_date）
-        parquet_path: 自定义 parquet 位置；None 用默认 生产产物/trade.parquet
+        parquet_path: 自定义 parquet 位置；None 用默认 production/trade.parquet
 
     Returns: dict
         {
@@ -559,7 +559,7 @@ class TradingCalendar:
     def from_panda_data(cls, start_date, end_date, exchange="SH"):
         """
         构造交易日历。策略（优先级由高到低）：
-          1. 生产产物/trade.parquet 存在且覆盖 end_date → 读盘
+          1. production/trade.parquet 存在且覆盖 end_date → 读盘
           2. 否则从 panda_data.get_trade_cal 实时拉取 start_date..end_date
 
         进程内单例（_CALENDAR_CACHE）复用：同一进程内第一次成功构造后，后续所有

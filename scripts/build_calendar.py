@@ -2,7 +2,7 @@
 """
 B11 交易日历初始化脚本
 
-拉取 A股交易日历（今天-3 年 到 今天+1 年）并写入 生产产物/trade.parquet，
+拉取 A股交易日历（今天-3 年 到 今天+1 年）并写入 production/trade.parquet，
 作为 build.py 运行时的离线缓存，加速 batch_manage 并避免高频调用 panda_data。
 
 用法：
@@ -28,10 +28,10 @@ from datetime import date, timedelta
 from pathlib import Path
 
 
-# 默认输出路径：src/build/build-b11-.../生产产物/trade.parquet
-# 本脚本位置: .../开发产物/scripts/build_calendar.py
-# 目标位置:   .../生产产物/trade.parquet         (与「开发产物/」同级)
-_DEFAULT_OUTPUT = Path(__file__).resolve().parent.parent.parent / "生产产物" / "trade.parquet"
+# 默认输出路径：与本 scripts/ 目录并列的 production/trade.parquet
+# 本脚本:  <skill_root>/scripts/build_calendar.py
+# 目标:    <skill_root>/production/trade.parquet
+_DEFAULT_OUTPUT = Path(__file__).resolve().parent.parent / "production" / "trade.parquet"
 
 
 def _login():
