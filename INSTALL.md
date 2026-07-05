@@ -1,13 +1,44 @@
 # Multi-Platform Install Guide
 
-This package contains 1 QuantSkills skill: `skill-b11-auto-stop-loss-take-profit` (Enhanced).
+This package contains 1 QuantSkills skill: `skill-b11-auto-stop-loss-take-profit` (Enhanced, **v2 hybrid**).
 
-> Enhanced release input schema — required per position:
+> **v2 Required per-position input schema**:
 > `code, entry_price, entry_date, current_qty, open_price, today, total_equity`.
 > Optional: `available_cash` (kept for backwards compat, **not** used as denominator),
-> `multiplier` (futures — overrides built-in table), `holding_trading_days`,
-> `trade_days`. Passing `holding_trading_days` or `trade_days` avoids any calendar
-> dependency.
+> `multiplier` (futures — overrides built-in table).
+>
+> **v1 fallback fields `holding_trading_days` / `trade_days` / `config["calendar"]` /
+> `config["trade_days"]` are REMOVED in v2.** The trading calendar is now hard-dependent
+> on [`panda_data`](https://pypi.org/project/panda-data/) `get_trade_cal`, backed by a
+> local snappy-compressed parquet cache at `production/trade.parquet`.
+
+---
+
+## v2 First-Run Prerequisites (all platforms)
+
+1. **Install runtime dependencies** (v2 no longer runs on stdlib alone):
+
+   ```bash
+   pip install panda_data pyarrow
+   ```
+
+2. **Configure credentials** (one-time env vars; `build.py` auto-calls `init_token`):
+
+   ```bash
+   export PANDA_USERNAME=<your_username>
+   export PANDA_PASSWORD=<your_password>
+   ```
+
+   Missing credentials raise `RuntimeError` on first calendar access with a guidance link.
+
+3. **Warm the local calendar cache** (fetches today−3y → today+1y, ~18.5KB, one-time):
+
+   ```bash
+   python3 scripts/build_calendar.py
+   ```
+
+   The shipped `production/trade.parquet` already contains a snapshot at publish time;
+   agents may call `refresh_calendar(force=False)` in-process instead of the CLI script.
 
 ---
 
@@ -32,9 +63,8 @@ After installation, invoke in Claude Code:
 /skill-b11-auto-stop-loss-take-profit
 ```
 
-Requirements: Python 3.8+ standard library only for the zero-dependency call paths.
-The optional production calendar path additionally requires `panda_data` and the
-`PANDA_USERNAME` / `PANDA_PASSWORD` environment variables.
+Requirements: Python 3.8+, `panda_data`, `pyarrow`, and `PANDA_USERNAME` / `PANDA_PASSWORD`
+env vars (see "v2 First-Run Prerequisites" above).
 
 ---
 
@@ -71,9 +101,7 @@ Add to your Codex SDK configuration:
                   "today": {"type": "string"},
                   "total_equity": {"type": "number", "description": "Total equity — the position-ratio denominator (option A)."},
                   "available_cash": {"type": "number", "description": "Optional, kept for backwards compat; NOT used as denominator."},
-                  "multiplier": {"type": "number", "description": "Futures contract multiplier; A-shares ignore it. Overrides built-in table."},
-                  "holding_trading_days": {"type": "integer", "description": "Optional trading-day count spanned since entry (zero-dependency path)."},
-                  "trade_days": {"type": "array", "items": {"type": "string"}, "description": "Optional trading-day sequence for this position (zero-dependency path)."}
+                  "multiplier": {"type": "number", "description": "Futures contract multiplier; A-shares ignore it. Overrides built-in table."}
                 },
                 "required": ["code", "entry_price", "entry_date", "current_qty", "open_price", "today", "total_equity"]
               }
@@ -131,7 +159,7 @@ Add to `.cursorrules`:
 When the user asks about stop-loss, take-profit, forced liquidation, or position sizing for A-shares or futures, use the b11-stop-loss-take-profit skill.
 
 Required per-position fields: code, entry_price, entry_date, current_qty, open_price, today, total_equity.
-Optional: multiplier (futures override), holding_trading_days, trade_days.
+Optional: multiplier (futures override).
 
 Run: python3 skill-b11-auto-stop-loss-take-profit/scripts/build.py
 ```
@@ -154,8 +182,8 @@ skills:
     entry: skill-b11-auto-stop-loss-take-profit/scripts/build.py
     description: >
       Enhanced stop-loss, take-profit, forced close, and single-name position cap
-      for A-shares and futures. Trading-day aware via injected
-      holding_trading_days / trade_days or panda_data.get_trade_cal.
+      for A-shares and futures. Trading-day aware via panda_data.get_trade_cal
+      (hard dependency, backed by local production/trade.parquet cache).
       Five-level priority: guard -> next-day TP (+5%) -> next-day SL (-3%) ->
       >= 2 trading-day forced close -> notional > 10% total_equity reduce -> hold.
     input_schema:
@@ -170,11 +198,9 @@ skills:
         total_equity: float
         available_cash: float?      # optional, not the denominator
         multiplier: float?           # futures override
-        holding_trading_days: int?   # zero-dependency path
-        trade_days: array<string>?   # zero-dependency path
     constraints:
-      - pure Python standard library (math / numbers / re / datetime / bisect)
-      - panda_data only required for the production calendar fallback
+      - business layer: pure Python stdlib (math / numbers / re / datetime / bisect)
+      - cache layer: panda_data + pyarrow (hard dependency)
       - research and educational use only
 ```
 
@@ -219,14 +245,11 @@ Register as an OpenClaw tool.
           total_equity: {type: number, description: "Total equity — the position-ratio denominator (option A)."}
           available_cash: {type: number, description: "Optional, kept for backwards compat; NOT used as denominator."}
           multiplier: {type: number, description: "Optional futures contract multiplier override."}
-          holding_trading_days: {type: integer, description: "Optional trading-day count (zero-dependency path)."}
-          trade_days: {type: array, description: "Optional trading-day sequence (zero-dependency path)."}
   limits:
     max_positions_per_call: 1000
   notes: |
     Research and educational use only. No investment advice.
-    Zero third-party dependencies for injected-calendar paths.
-    Optional panda_data for the production calendar fallback.
+    v2 hard-depends on panda_data + pyarrow; run scripts/build_calendar.py once to warm production/trade.parquet.
 ```
 
 ---
@@ -234,9 +257,10 @@ Register as an OpenClaw tool.
 ## Usage Boundaries (All Platforms)
 
 - **Research & educational use only** — not investment advice.
-- Caller supplies all position data; this skill does not fetch market data (only optional calendar lookups via `panda_data`).
+- Caller supplies all position data; this skill fetches only the trading calendar via `panda_data`.
 - Long-only; no short/hedge positions.
 - Does not model price limits, trading halts, liquidity, or slippage.
 - Trading calendar defaults to A-shares (SH exchange); HK / US not supported.
 - Unknown futures symbols require an explicit `multiplier`.
+- v2 requires `panda_data` + `pyarrow` and env credentials on first calendar access; run `scripts/build_calendar.py` once to warm `production/trade.parquet`.
 - See `SKILL.md` for full limitations and `README.md` / `README.en.md` for overview.

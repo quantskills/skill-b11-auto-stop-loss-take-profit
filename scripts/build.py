@@ -122,19 +122,257 @@ def _resolve_multiplier(code, multiplier=None):
 
 
 # ============================================================
-# 交易日历（E1：可注入 / 可降级，避免 test.py 依赖真实 panda_data）
+# 交易日历（唯一来源：panda_data；优先读本地 parquet 缓存）
 # ============================================================
+#
+# 依赖：需先安装 panda_data 包，并在环境变量中配置 PANDA_USERNAME / PANDA_PASSWORD。
+#
+#   pip install panda_data
+#   export PANDA_USERNAME=your_username
+#   export PANDA_PASSWORD=your_password
+#
+# 加速与离线：可先运行 `python3 scripts/build_calendar.py` 生成
+# `生产产物/trade.parquet`（默认覆盖 今天-3年..今天+1年），运行时优先读该文件；
+# 未找到或过期（最晚交易日 < today）时自动回退到实时 panda_data.get_trade_cal。
+#
+# 缓存策略：TradingCalendar 单例进程内复用（_CALENDAR_CACHE），避免 batch_manage 重复 IO。
+
+import os as _os
+from pathlib import Path as _Path
+
+# 生产产物 trade.parquet 相对本文件的位置
+# 本文件位置: .../开发产物/scripts/build.py
+# 目标位置:   .../生产产物/trade.parquet  (与「开发产物/」同级)
+_TRADE_PARQUET_PATH = _Path(__file__).resolve().parent.parent.parent / "生产产物" / "trade.parquet"
+
+_PANDA_LOGIN_DONE = False   # 模块级登录状态标记，避免重复 init_token
+_CALENDAR_CACHE = None      # 模块级 TradingCalendar 单例（parquet 或实时拉取，缓存首个成功结果）
+
+
+def _ensure_panda_logged_in():
+    """
+    首次调用交易日历前的懒登录：
+      1. 检查 panda_data 是否已安装；未装 → RuntimeError 含 pip install 引导
+      2. 检查 PANDA_USERNAME / PANDA_PASSWORD 环境变量；缺失 → RuntimeError 含 export 引导
+      3. 调 panda_data.init_token(username, password)；成功后设置模块级标记
+      4. 重复调用直接返回（幂等）
+    """
+    global _PANDA_LOGIN_DONE
+    if _PANDA_LOGIN_DONE:
+        return
+    try:
+        import panda_data
+    except ImportError as e:
+        raise RuntimeError(
+            "B11 需要 panda_data 提供交易日历。请先安装：\n"
+            "    pip install panda_data\n"
+            "再在环境变量中配置：\n"
+            "    export PANDA_USERNAME=<your_username>\n"
+            "    export PANDA_PASSWORD=<your_password>"
+        ) from e
+    username = _os.environ.get("PANDA_USERNAME")
+    password = _os.environ.get("PANDA_PASSWORD")
+    if not username or not password:
+        raise RuntimeError(
+            "B11 需要 PANDA_USERNAME / PANDA_PASSWORD 环境变量以登录 panda_data。\n"
+            "请在 shell 配置文件（如 ~/.zshrc / ~/.bashrc）中添加：\n"
+            "    export PANDA_USERNAME=<your_username>\n"
+            "    export PANDA_PASSWORD=<your_password>\n"
+            "然后重新打开终端或 source 该文件。"
+        )
+    panda_data.init_token(username=username, password=password)
+    _PANDA_LOGIN_DONE = True
+
+
+def _load_trade_days_from_parquet(parquet_path, today):
+    """
+    读 trade.parquet 并返回 YYYY-MM-DD 交易日列表。
+    - 文件不存在 → None
+    - 覆盖不到 today（最晚交易日 < today）→ None，触发回退
+    读盘失败或 schema 异常也返回 None，让上层回退到实时拉取。
+    """
+    p = _Path(parquet_path)
+    if not p.is_file():
+        return None
+    try:
+        import pyarrow.parquet as pq
+        table = pq.read_table(p, columns=["nature_date"])
+        nature_dates = table.column("nature_date").to_pylist()
+    except Exception:
+        return None
+    if not nature_dates:
+        return None
+    # nature_date 是 int64 的 YYYYMMDD；转 YYYY-MM-DD 字符串
+    today_int = int(today.replace("-", ""))
+    max_date = max(int(x) for x in nature_dates if x is not None)
+    if max_date < today_int:
+        # 缓存过期，让上层拉实时（避免用旧日历漏判未来的交易日）
+        return None
+    return [
+        f"{str(int(x))[:4]}-{str(int(x))[4:6]}-{str(int(x))[6:8]}"
+        for x in nature_dates if x is not None
+    ]
+
+
+# ============================================================
+# 公开 API：agent 侧交易日历检查与更新
+# ============================================================
+
+def inspect_calendar(parquet_path=None):
+    """
+    只读探查 trade.parquet 状态，供 agent 决定是否需要 refresh_calendar。
+
+    Args:
+        parquet_path: 自定义 parquet 位置；None 用默认 生产产物/trade.parquet
+
+    Returns: dict
+        {
+            "exists":       bool,             # 文件是否存在
+            "path":         str,              # 检查的路径
+            "count":        int,              # 交易日数量（不存在=0）
+            "date_min":     "YYYY-MM-DD"|None,# 最早交易日
+            "date_max":     "YYYY-MM-DD"|None,# 最晚交易日
+            "today":        "YYYY-MM-DD",     # 系统当前日期
+            "covers_today": bool,             # date_max >= today
+            "days_to_expiry": int|None,       # date_max - today 的自然日数（负=已过期）
+            "recommendation": str,            # "ok" | "refresh_recommended" | "refresh_required" | "missing"
+            "reason":       str,              # 判定原因
+        }
+    """
+    from datetime import date as _date
+    path = _Path(parquet_path or _TRADE_PARQUET_PATH)
+    today_str = _date.today().isoformat()
+    today_int = int(today_str.replace("-", ""))
+
+    if not path.is_file():
+        return {
+            "exists": False, "path": str(path), "count": 0,
+            "date_min": None, "date_max": None, "today": today_str,
+            "covers_today": False, "days_to_expiry": None,
+            "recommendation": "missing",
+            "reason": "trade.parquet 不存在。运行 `python3 scripts/build_calendar.py` 首次生成。",
+        }
+    try:
+        import pyarrow.parquet as pq
+        table = pq.read_table(path, columns=["nature_date"])
+        nature_dates = [int(x) for x in table.column("nature_date").to_pylist() if x is not None]
+    except Exception as e:
+        return {
+            "exists": True, "path": str(path), "count": 0,
+            "date_min": None, "date_max": None, "today": today_str,
+            "covers_today": False, "days_to_expiry": None,
+            "recommendation": "refresh_required",
+            "reason": f"读盘失败: {type(e).__name__}: {e}",
+        }
+    if not nature_dates:
+        return {
+            "exists": True, "path": str(path), "count": 0,
+            "date_min": None, "date_max": None, "today": today_str,
+            "covers_today": False, "days_to_expiry": None,
+            "recommendation": "refresh_required",
+            "reason": "parquet 为空，需重新生成。",
+        }
+
+    date_min_int = min(nature_dates)
+    date_max_int = max(nature_dates)
+    date_max_str = f"{str(date_max_int)[:4]}-{str(date_max_int)[4:6]}-{str(date_max_int)[6:8]}"
+    date_min_str = f"{str(date_min_int)[:4]}-{str(date_min_int)[4:6]}-{str(date_min_int)[6:8]}"
+
+    # 自然日差（近似）：只算 today 与 date_max 的自然日距离，用于给 agent 提醒阈值
+    from datetime import datetime as _dt
+    days_to_expiry = (_dt.strptime(date_max_str, "%Y-%m-%d") - _dt.strptime(today_str, "%Y-%m-%d")).days
+
+    covers_today = date_max_int >= today_int
+    if not covers_today:
+        recommendation = "refresh_required"
+        reason = f"缓存已过期（date_max={date_max_str} < today={today_str}）。运行 refresh_calendar(force=True)。"
+    elif days_to_expiry < 30:
+        recommendation = "refresh_recommended"
+        reason = f"缓存即将过期（余 {days_to_expiry} 自然日）。建议运行 refresh_calendar()。"
+    else:
+        recommendation = "ok"
+        reason = f"缓存正常（date_max={date_max_str}，余 {days_to_expiry} 自然日）。"
+
+    return {
+        "exists": True, "path": str(path), "count": len(nature_dates),
+        "date_min": date_min_str, "date_max": date_max_str, "today": today_str,
+        "covers_today": covers_today, "days_to_expiry": days_to_expiry,
+        "recommendation": recommendation, "reason": reason,
+    }
+
+
+def refresh_calendar(force=False, years_back=3, years_forward=1,
+                     exchange="SH", parquet_path=None):
+    """
+    检查并按需刷新 trade.parquet；供 agent 定期/按需调用。
+
+    判定规则（force=False 时）：
+      - 缺失 或 覆盖不到 today          → 强制刷新
+      - date_max 距 today < 30 自然日   → 刷新（预防长假前失效）
+      - 否则                             → 跳过
+
+    Args:
+        force: True 无视缓存直接重跑
+        years_back / years_forward / exchange: 透传给 build_calendar.build_calendar
+        parquet_path: 自定义输出路径
+
+    Returns: dict
+        {
+            "updated":    bool,       # 是否实际重跑
+            "reason":     str,        # 判定原因
+            "before":     dict,       # 更新前 inspect_calendar 结果
+            "after":      dict|None,  # 更新后 inspect_calendar 结果（未更新为 None）
+            "file_size":  int|None,   # 新文件字节数（未更新为 None）
+        }
+    """
+    before = inspect_calendar(parquet_path)
+    should_refresh = force or before["recommendation"] in ("missing", "refresh_required", "refresh_recommended")
+    if not should_refresh:
+        return {
+            "updated": False,
+            "reason": f"跳过：{before['reason']}",
+            "before": before, "after": None, "file_size": None,
+        }
+
+    # 触发生成：优先复用 build_calendar 模块的实现，避免逻辑重复
+    import sys as _sys
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    try:
+        import build_calendar
+        build_calendar.build_calendar(
+            years_back=years_back, years_forward=years_forward,
+            exchange=exchange, output_path=parquet_path,
+        )
+    except Exception as e:
+        return {
+            "updated": False,
+            "reason": f"刷新失败：{type(e).__name__}: {e}",
+            "before": before, "after": None, "file_size": None,
+        }
+
+    # 清缓存单例，让下次决策读到新日历
+    global _CALENDAR_CACHE
+    _CALENDAR_CACHE = None
+
+    after = inspect_calendar(parquet_path)
+    file_size = _Path(after["path"]).stat().st_size if after["exists"] else None
+    return {
+        "updated": True,
+        "reason": f"已刷新（{before['recommendation']} → {after['recommendation']}）",
+        "before": before, "after": after, "file_size": file_size,
+    }
+
 
 class TradingCalendar:
     """
-    交易日历抽象。提供两个能力：
-      - holding_trading_days(entry_date, today): 持仓跨越的交易日数（entry 当天 = 第 0 个交易日）
-      - is_next_day(entry_date, today): today 是否为 entry 的下一个交易日（holding_trading_days == 1）
+    交易日历。唯一来源：panda_data.get_trade_cal（或其 parquet 缓存）。
 
-    三种构造来源（按优先级，满足"可注入/可降级"）：
-      1. TradingCalendar(trade_days=[...])  调用方显式传入交易日序列（YYYY-MM-DD 升序），零三方依赖
-      2. config 注入自定义对象（鸭子类型，实现上述两个方法即可）—— 用于测试 stub
-      3. TradingCalendar.from_panda_data()  接入 panda_data.get_trade_cal（生产环境，定向例外）
+    提供两个能力：
+      - holding_trading_days(entry_date, today): 持仓跨越的交易日数（entry 当天 = 第 0 个交易日）
+      - is_next_day(entry_date, today): today 是否为 entry 的下一个交易日（== 1 时为真）
+
+    构造方式：`TradingCalendar.from_panda_data(entry_date, today)`
+    （手动传 trade_days 的构造仅供 test 内部 monkey-patch 使用）
     """
 
     def __init__(self, trade_days):
@@ -143,7 +381,6 @@ class TradingCalendar:
         self._days = days
         self._index = {d: i for i, d in enumerate(days)}
 
-    # ---- 交易日序号 ----
     def _ordinal(self, date_str):
         """返回该日期在交易日序列中的序号；非交易日返回 None。"""
         return self._index.get(date_str)
@@ -153,22 +390,17 @@ class TradingCalendar:
         entry 当天记为第 0 个交易日。返回 today 相对 entry 跨越的交易日数。
         - entry/today 均为交易日时：直接取序号差 ti - ei（精确）。
         - 任一为非交易日（数据异常）时回退到"夹逼"语义：
-          (<= today 的交易日数) - (<= entry 的交易日数)，保证非负且单调，不崩溃。
+          (<= today 的交易日数) - (<= entry 的交易日数)，保证单调，不崩溃。
         - today < entry 时返回负数（交由守卫层处理）。
         """
         ei = self._ordinal(entry_date)
         ti = self._ordinal(today)
         if ei is not None and ti is not None:
             return ti - ei
-        # 非交易日兜底：基于排序位置夹逼
-        ei2 = self._count_le(entry_date)  # <= entry 的交易日数
-        ti2 = self._count_le(today)       # <= today 的交易日数
-        return ti2 - ei2
-
-    def _count_le(self, date_str):
-        """返回 <= date_str 的交易日个数。"""
         import bisect
-        return bisect.bisect_right(self._days, date_str)
+        ei2 = bisect.bisect_right(self._days, entry_date)
+        ti2 = bisect.bisect_right(self._days, today)
+        return ti2 - ei2
 
     def holding_trading_days(self, entry_date, today):
         """持仓交易日数（entry 当天=0）。今天=entry 返回 0，次日返回 1，T+2 返回 2。"""
@@ -181,23 +413,33 @@ class TradingCalendar:
     @classmethod
     def from_panda_data(cls, start_date, end_date, exchange="SH"):
         """
-        生产环境：从 panda_data.get_trade_cal 构造交易日历（定向例外）。
+        构造交易日历。策略（优先级由高到低）：
+          1. 生产产物/trade.parquet 存在且覆盖 end_date → 读盘
+          2. 否则从 panda_data.get_trade_cal 实时拉取 start_date..end_date
+
+        进程内单例（_CALENDAR_CACHE）复用：同一进程内第一次成功构造后，后续所有
+        调用直接返回该单例；跨进程需重启或手动清空 _CALENDAR_CACHE。
+
         入参 start_date/end_date 为 YYYY-MM-DD；内部转 YYYYMMDD 调用。
-        沙箱无 panda_data 时抛 ImportError，调用方应改用 trade_days 注入。
         """
-        try:
-            import panda_data  # noqa: F401  仅在生产路径导入
-        except ImportError as e:
-            raise ImportError(
-                "panda_data 不可用；请改用 TradingCalendar(trade_days=[...]) "
-                "或 config['calendar'] 注入交易日历"
-            ) from e
+        global _CALENDAR_CACHE
+        if _CALENDAR_CACHE is not None:
+            return _CALENDAR_CACHE
+
+        # 1) 优先读 parquet 缓存
+        trade_days = _load_trade_days_from_parquet(_TRADE_PARQUET_PATH, end_date)
+        if trade_days:
+            _CALENDAR_CACHE = cls(trade_days)
+            return _CALENDAR_CACHE
+
+        # 2) 回退实时拉取
+        _ensure_panda_logged_in()
+        import panda_data
         s = start_date.replace("-", "")
         e = end_date.replace("-", "")
         result = panda_data.get_trade_cal(
             start_date=s, end_date=e, exchange=exchange, is_trading_day=1, fields=[]
         )
-        # result 为表格（DataFrame 或可迭代记录）；提取 is_trade==1 的 nature_date
         trade_days = []
         records = result.to_dict("records") if hasattr(result, "to_dict") else result
         for row in records:
@@ -206,35 +448,9 @@ class TradingCalendar:
             if is_trade == 1 and nd is not None:
                 s = str(nd)
                 trade_days.append(f"{s[0:4]}-{s[4:6]}-{s[6:8]}")
-        return cls(trade_days)
+        _CALENDAR_CACHE = cls(trade_days)
+        return _CALENDAR_CACHE
 
-
-def _resolve_calendar(pos, config):
-    """
-    [E1] 解析交易日历，按执行优先级（先命中先返回）：
-      1. pos["holding_trading_days"]   调用方直接给出持仓交易日数（最轻量，零依赖）
-      2. config["calendar"]            注入对象（测试 stub / 自定义）
-      3. pos["trade_days"]             该条持仓自带交易日序列
-      4. config["trade_days"]          全局交易日序列
-      5. panda_data.get_trade_cal      生产兜底
-    返回 (calendar_or_None, explicit_holding_days_or_None)。
-    """
-    config = config or {}
-    # 1) 显式持仓交易日数：直接短路，无需日历对象
-    if "holding_trading_days" in pos and pos["holding_trading_days"] is not None:
-        return None, pos["holding_trading_days"]
-    # 2) 注入对象
-    cal = config.get("calendar")
-    if cal is not None:
-        return cal, None
-    # 3) 该条自带交易日序列
-    if pos.get("trade_days"):
-        return TradingCalendar(pos["trade_days"]), None
-    # 4) 全局交易日序列
-    if config.get("trade_days"):
-        return TradingCalendar(config["trade_days"]), None
-    # 5) 生产兜底：从 panda_data 拉取 entry..today 区间日历
-    return TradingCalendar.from_panda_data(pos["entry_date"], pos["today"]), None
 
 
 # ============================================================
@@ -328,19 +544,20 @@ def validate_input(pos):
 
 def manage_position(code, entry_price, entry_date, current_qty, open_price, today,
                     total_equity, multiplier=None,
-                    trade_days=None, holding_trading_days=None, config=None,
                     **_ignored):
     """
     核心决策函数。决策优先级：TP > SL > 强平 > 减仓 > hold，全程仅用当日可得数据。
 
-    Args 关键新增（增强）：
+    Args:
         total_equity (E2): 仓位比例分母（持仓市值+现金，调用方传入）。<=0 短路 hold。
         multiplier   (E4): 期货合约乘数；A股恒为 1；未知期货且未传 → 报错。
-        trade_days / holding_trading_days / config["calendar"] (E1): 交易日历来源。
         **_ignored: 吞掉调用方 pos dict 中的可选透传字段（如 available_cash），不参与决策。
+
+    交易日历唯一来源 = panda_data.get_trade_cal，需先配置 PANDA_USERNAME/PANDA_PASSWORD
+    环境变量并 `pip install panda_data`；缺失时抛 RuntimeError 含引导。
+
     Returns: dict，8 字段（code/pnl_pct/current_qty/time/action/qty_change/target_qty/reason）。
     """
-    config = config or {}
     pnl_pct = (open_price - entry_price) / entry_price
 
     def _mk_order(action, target_qty, reason):
@@ -364,18 +581,10 @@ def manage_position(code, entry_price, entry_date, current_qty, open_price, toda
             or total_equity <= 0:
         return _mk_order("hold", current_qty, f"[B11]hold 总权益非正({total_equity})，跳过仓位校验")
 
-    # ---- 交易日语义（E1） ----
-    pos_for_cal = {
-        "entry_date": entry_date, "today": today,
-        "trade_days": trade_days, "holding_trading_days": holding_trading_days,
-    }
-    cal, explicit_hold = _resolve_calendar(pos_for_cal, config)
-    if explicit_hold is not None:
-        hold_tdays = int(explicit_hold)
-        is_next = (hold_tdays == 1)
-    else:
-        hold_tdays = cal.holding_trading_days(entry_date, today)
-        is_next = cal.is_next_day(entry_date, today)
+    # ---- 交易日语义（E1）：唯一来源 panda_data.get_trade_cal ----
+    cal = TradingCalendar.from_panda_data(entry_date, today)
+    hold_tdays = cal.holding_trading_days(entry_date, today)
+    is_next = cal.is_next_day(entry_date, today)
 
     # E5：today < entry（交易日维度持仓为负）守卫
     if hold_tdays < 0:
@@ -422,14 +631,9 @@ def manage_position(code, entry_price, entry_date, current_qty, open_price, toda
 # 批量层
 # ============================================================
 
-def batch_manage(positions, config=None):
-    """批量处理持仓列表。config 透传（含交易日历注入）。"""
-    out = []
-    for pos in positions:
-        kwargs = dict(pos)
-        kwargs["config"] = config
-        out.append(manage_position(**kwargs))
-    return out
+def batch_manage(positions):
+    """批量处理持仓列表。"""
+    return [manage_position(**pos) for pos in positions]
 
 
 # ============================================================
@@ -448,14 +652,17 @@ def print_order(order):
 # 标准入口
 # ============================================================
 
-def run(input_data, config=None):
+def run(input_data):
     """
     标准入口函数。
     Args:
         input_data: dict（单条）或 list[dict]（批量）
-        config: dict，可选。支持 config["calendar"]（注入交易日历）/ config["trade_days"]（全局交易日序列）
     Returns:
         dict（单条）或 list[dict]（批量）
+
+    交易日历唯一来源 = panda_data.get_trade_cal。首次调用会自动读取环境变量
+    PANDA_USERNAME / PANDA_PASSWORD 完成 init_token 登录；未装 panda_data 或
+    env 缺失时抛 RuntimeError 含引导信息。
     """
     if isinstance(input_data, list):
         if len(input_data) == 0:
@@ -464,14 +671,12 @@ def run(input_data, config=None):
             ok, err = validate_input(pos)
             if not ok:
                 raise ValueError(f"输入[{i}]校验失败: {err}")
-        return batch_manage(input_data, config=config)
+        return batch_manage(input_data)
     elif isinstance(input_data, dict):
         ok, err = validate_input(input_data)
         if not ok:
             raise ValueError(f"输入校验失败: {err}")
-        kwargs = dict(input_data)
-        kwargs["config"] = config
-        return manage_position(**kwargs)
+        return manage_position(**input_data)
     else:
         raise TypeError("run() 入参必须为 dict 或 list[dict]")
 
@@ -479,17 +684,18 @@ def run(input_data, config=None):
 # ============================================================
 # 示例（__main__）
 # ============================================================
+#
+# 前置条件（否则抛 RuntimeError）：
+#   pip install panda_data
+#   export PANDA_USERNAME=<your_username>
+#   export PANDA_PASSWORD=<your_password>
+#
+# 首次调用交易日历时自动 init_token 登录 panda_data，从 get_trade_cal 拉取
+# entry_date..today 区间的交易日序列。
 
 if __name__ == "__main__":
-    # 构造一段交易日历（跨周末：2026-06-19 周五，下一交易日为 2026-06-22 周一）
-    TRADE_DAYS = [
-        "2026-06-17", "2026-06-18", "2026-06-19",  # 周三/四/五
-        "2026-06-22", "2026-06-23", "2026-06-24",  # 下周一/二/三
-    ]
-    cfg = {"trade_days": TRADE_DAYS}
-
     examples = [
-        {   # A股次日止盈：周五入场，周一(真实交易日次日)高开 +5.5%
+        {   # A股次日止盈：周五(06-19)入场，周一(06-22, 真实交易日次日)高开 +5.5%
             "code": "600036", "entry_price": 10.0, "entry_date": "2026-06-19",
             "current_qty": 800, "open_price": 10.55,
             "total_equity": 100000, "today": "2026-06-22",
@@ -516,11 +722,11 @@ if __name__ == "__main__":
         },
     ]
 
-    print("=== B11 自动止盈止损+仓位管理（增强版）===\n")
+    print("=== B11 自动止盈止损+仓位管理 ===\n")
     for pos in examples:
-        order = run(pos, config=cfg)
+        order = run(pos)
         print_order(order)
 
     print("\n=== 批量调用 ===")
-    for r in run(examples, config=cfg):
+    for r in run(examples):
         print(f"{r['code']:<10s}: {r['action']:<4s} qty_change={r['qty_change']:+d}")
