@@ -5,6 +5,114 @@
 > 本版本为对 52/100 验收版的**增强修复**，全面落地 6 项缺陷改进（E1–E6），**v2 已升级为混合型 BUILD**——生产产物 `production/trade.parquet` 提供本地交易日历缓存，agent 侧新增 `inspect_calendar()` / `refresh_calendar()` 自主决策 API。
 > **v3 追加**：新增 `check_date_coverage(start_date, end_date=None)` 一键查询 API——agent 拿到任意日期或回测区间，一次调用即返回「是否在日历覆盖范围内 + 缺口 + 扩展建议 + 可直接执行的 refresh 命令」。
 
+---
+
+## ⚡ Agent 快速集成（3 分钟跑通）
+
+其他 agent 拉取本 skill 后，按 3 步即可产出交易决策：
+
+### Step 1 — 安装与配置（一次性）
+
+```bash
+# 装依赖
+pip install panda_data pyarrow
+
+# 配置 panda_data 凭据（写入 ~/.zshrc 或 ~/.bashrc 后 source）
+export PANDA_USERNAME=<your_username>
+export PANDA_PASSWORD=<your_password>
+```
+
+> `production/trade.parquet` 已随仓库发布（971 交易日 / ~18.5KB），开箱可用；若需扩展范围再运行 `python3 scripts/build_calendar.py`。
+
+### Step 2 — 从 agent 代码里调用（最短 3 行）
+
+```python
+import sys
+sys.path.insert(0, "/path/to/skill-b11-auto-stop-loss-take-profit/scripts")
+from build import run
+
+order = run({
+    "code":         "600036",
+    "entry_price":  10.0,
+    "entry_date":   "2026-06-19",   # 周五入场
+    "current_qty":  800,
+    "open_price":   10.55,          # 次日 +5.5%
+    "today":        "2026-06-22",   # 周一（交易日次日）
+    "total_equity": 1_000_000,      # ⭐ 必传：总权益作为仓位比分母
+})
+# → {"code": "600036", "action": "sell", "target_qty": 0, "qty_change": -800,
+#    "reason": "[B11]次日高开止盈 ...", ...}
+```
+
+批量调用只需传 list：`run([pos1, pos2, ...])` 返回同长度 list。
+
+### Step 3 — 遇到「日历不覆盖你的日期」时（3 层 API）
+
+```python
+from build import check_date_coverage, refresh_calendar
+
+# 拿到未知日期先问 —— 一次调用拿齐范围/覆盖/建议/命令
+r = check_date_coverage("2020-01-15")   # 或区间 check_date_coverage("2020-01-15", "2029-06-01")
+
+if not r["in_range"]:
+    # r 已算好建议参数，agent 直接传给 refresh_calendar
+    refresh_calendar(force=True,
+                     years_back=r["suggested_years_back"],
+                     years_forward=r["suggested_years_forward"])
+# 之后再调 run(...) 即可
+```
+
+### Step 4 — 常见平台集成
+
+| 平台 | 集成方式 |
+|---|---|
+| **Python agent（最通用）** | 上面 Step 2 三行代码，或 `python3 scripts/build.py` |
+| **Claude Code** | `cp -R . ~/.claude/skills/skill-b11-auto-stop-loss-take-profit`；`/skill-b11-...` 触发 |
+| **Cursor** | `.cursor/tools.json` 注册（`INSTALL.md § Cursor`） |
+| **OpenAI Codex** | 函数工具 JSON schema（`INSTALL.md § Codex`） |
+| **Hermes / OpenClaw** | YAML 配置（`INSTALL.md § Hermes` / `§ OpenClaw`） |
+
+### 必传字段一览
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|:---:|---|
+| `code` | str | ✅ | A股（`600036`/`sh600036`）或期货（`IF2406`/`rb2410`） |
+| `entry_price` | float | ✅ | 入场价 |
+| `entry_date` | str | ✅ | 入场日 `YYYY-MM-DD` |
+| `current_qty` | int | ✅ | 当前持仓（A股股数 / 期货手数） |
+| `open_price` | float | ✅ | 今日开盘价 |
+| `today` | str | ✅ | 当前日 `YYYY-MM-DD`（须 ≥ entry_date） |
+| `total_equity` | float | ✅ | **总权益（仓位比分母）**，`≤0` 时返回 hold |
+| `multiplier` | float | ⭕️ | 期货合约乘数；A股忽略；未知期货品种必传 |
+
+### 输出契约（8 字段调仓指令）
+
+```python
+{
+    "code":        "600036",
+    "pnl_pct":     0.055,          # 浮盈亏（小数）
+    "current_qty": 800,
+    "time":        "2026-06-22",
+    "action":      "sell",         # "sell" / "hold"（不产生 buy）
+    "qty_change":  -800,           # 负=卖出，0=不动
+    "target_qty":  0,
+    "reason":      "[B11]次日高开止盈 ...",
+}
+```
+
+### 遇到问题的最快诊断
+
+| 现象 | 排查 |
+|---|---|
+| `RuntimeError: 需要 panda_data` | `pip install panda_data pyarrow` |
+| `RuntimeError: 需要 PANDA_USERNAME / PANDA_PASSWORD` | 配置 env 后 `source ~/.zshrc` |
+| `ValueError: 未知期货品种` | 传 `multiplier` 参数覆盖 |
+| `ValueError: 缺少字段: total_equity` | v2 必传总权益 |
+| 全部返回 hold，reason 含"总权益非正" | 传入的 `total_equity ≤ 0` |
+| 回测日期不在日历范围内 | `check_date_coverage()` → 按建议 `refresh_calendar(force=True, ...)` |
+
+---
+
 ## ⚠️ 免责声明
 
 - **仅供研究与教育用途**：本 skill 仅为量化交易研究工具，不构成任何形式的投资建议、理财建议或交易推荐。
@@ -48,28 +156,37 @@ python3 scripts/build.py
 python3 scripts/_verify_prod.py
 ```
 
-## Agent 使用示例
+## Agent 使用示例（详细）
 
-v3 起，agent 侧首选入口是 `check_date_coverage`——一次调用拿齐范围/覆盖/建议/命令：
+上面「⚡ Agent 快速集成」是最短路径；下面是 `check_date_coverage` 三层 SOP 的完整调用形态。
 
 ```python
 from scripts.build import check_date_coverage, refresh_calendar, run
 
 # 1. 一键查询：agent 拿到未知日期先问日历
 r = check_date_coverage("2020-01-15")   # 或 ("2020-01-15", "2029-06-01") 查区间
-# {'in_range': False, 'coverage': 'before_min',
-#  'suggested_years_back': 6, 'suggested_years_forward': 1,
-#  'suggested_action': 'refresh', 'refresh_command': 'refresh_calendar(force=True, years_back=6, years_forward=1)', ...}
+# {
+#   "in_range": False,
+#   "coverage": {"date_min": "2023-07-06", "date_max": "2027-07-05", "count": 971},
+#   "gap_before": 1268, "gap_after": 0,
+#   "suggested_years_back": 7, "suggested_years_forward": 1,
+#   "suggested_action": "extend_back",
+#   "refresh_command": "refresh_calendar(force=True, years_back=7, years_forward=1)",
+#   "reason": "start=2020-01-15 早于 date_min=2023-07-06（缺 1268 天）..."
+# }
 
-# 2. 按建议扩容（agent 只需照抄 refresh_command）
-if r["suggested_action"] == "refresh":
+# 2. 按建议扩容（agent 只需照抄 refresh_command 的参数）
+if not r["in_range"]:
     refresh_calendar(force=True,
                      years_back=r["suggested_years_back"],
                      years_forward=r["suggested_years_forward"])
 
-# 3. 正常调用主入口
-order = run(pos={"code": "600519", "entry_date": "2025-01-02", ...},
-            config={"total_equity": 1_000_000})
+# 3. 正常调用主入口（单条 dict 或批量 list[dict]）
+order = run({
+    "code": "600519", "entry_price": 1_800.0, "entry_date": "2025-01-02",
+    "current_qty": 100, "open_price": 1_890.0, "today": "2025-01-03",
+    "total_equity": 5_000_000,
+})
 ```
 
 底层仍提供 `inspect_calendar()`（只读健康检查）/ `refresh_calendar(force, years_back, years_forward)`（按需刷新）——完整三层 SOP 与 7 种触发场景决策表见 `SKILL.md` § Agent 更新 SOP。
