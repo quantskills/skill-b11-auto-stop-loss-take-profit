@@ -1,6 +1,13 @@
 # Multi-Platform Install Guide
 
-This package contains 1 QuantSkills skill: `skill-b11-auto-stop-loss-take-profit`.
+This package contains 1 QuantSkills skill: `skill-b11-auto-stop-loss-take-profit` (Enhanced).
+
+> Enhanced release input schema — required per position:
+> `code, entry_price, entry_date, current_qty, open_price, today, total_equity`.
+> Optional: `available_cash` (kept for backwards compat, **not** used as denominator),
+> `multiplier` (futures — overrides built-in table), `holding_trading_days`,
+> `trade_days`. Passing `holding_trading_days` or `trade_days` avoids any calendar
+> dependency.
 
 ---
 
@@ -25,7 +32,9 @@ After installation, invoke in Claude Code:
 /skill-b11-auto-stop-loss-take-profit
 ```
 
-Requirements: Python 3.8+ (standard library only, zero third-party dependencies).
+Requirements: Python 3.8+ standard library only for the zero-dependency call paths.
+The optional production calendar path additionally requires `panda_data` and the
+`PANDA_USERNAME` / `PANDA_PASSWORD` environment variables.
 
 ---
 
@@ -44,7 +53,7 @@ Add to your Codex SDK configuration:
       "type": "function",
       "function": {
         "name": "skill_b11_auto_stop_loss_take_profit",
-        "description": "Automated stop-loss, take-profit, and position sizing for A-shares and futures. Supports next-day gap-up take-profit (+5%), next-day gap-down stop-loss (-3%), forced liquidation on holding timeout (≥2 days), and single-stock position cap (>10%). Input: positions list with entry_price, entry_date, current_qty, open_price, available_cash, today. Output: standardized 8-field position adjustment orders.",
+        "description": "Automated stop-loss, take-profit, forced close, and position cap for A-shares and futures. Priority: guard > next-day take-profit (+5%) > next-day stop-loss (-3%) > holding >=2 trading days force close > single-name notional > 10% of total_equity reduce. Trading-day aware calendar via injected holding_trading_days/trade_days or panda_data. Emits the 8-field position adjustment order.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -59,10 +68,14 @@ Add to your Codex SDK configuration:
                   "entry_date": {"type": "string"},
                   "current_qty": {"type": "integer"},
                   "open_price": {"type": "number"},
-                  "available_cash": {"type": "number"},
-                  "today": {"type": "string"}
+                  "today": {"type": "string"},
+                  "total_equity": {"type": "number", "description": "Total equity — the position-ratio denominator (option A)."},
+                  "available_cash": {"type": "number", "description": "Optional, kept for backwards compat; NOT used as denominator."},
+                  "multiplier": {"type": "number", "description": "Futures contract multiplier; A-shares ignore it. Overrides built-in table."},
+                  "holding_trading_days": {"type": "integer", "description": "Optional trading-day count spanned since entry (zero-dependency path)."},
+                  "trade_days": {"type": "array", "items": {"type": "string"}, "description": "Optional trading-day sequence for this position (zero-dependency path)."}
                 },
-                "required": ["code", "entry_price", "entry_date", "current_qty", "open_price", "available_cash", "today"]
+                "required": ["code", "entry_price", "entry_date", "current_qty", "open_price", "today", "total_equity"]
               }
             }
           },
@@ -77,33 +90,33 @@ Add to your Codex SDK configuration:
 ### Running Locally
 
 ```bash
-cd skill-b11-auto-stop-loss-take-profit/scripts
-python3 build.py
+cd skill-b11-auto-stop-loss-take-profit
+python3 scripts/build.py
 ```
 
-The build script is callable from any Codex-managed Python runtime:
+Callable from any Codex-managed Python runtime:
 
 ```python
 import sys
 sys.path.insert(0, "/path/to/skill-b11-auto-stop-loss-take-profit/scripts")
 from build import run
-results = run(positions)
+results = run(positions)  # list or dict; see references/api_guide.md
 ```
 
 ---
 
 ## Cursor
 
-This skill is compatible with Cursor's custom tools and `.cursorrules`.
+Compatible with Cursor's custom tools and `.cursorrules`.
 
 ### As a Cursor Tool
 
-Add to `.cursor/tools.json` or your project's tool configuration:
+Add to `.cursor/tools.json`:
 
 ```json
 {
   "name": "b11-stop-loss-take-profit",
-  "description": "Auto stop-loss, take-profit, and position sizing for A-shares and futures",
+  "description": "Auto stop-loss, take-profit, forced close, and single-name cap for A-shares and futures (enhanced, trading-day aware).",
   "command": "python3",
   "args": ["${WORKSPACE}/skill-b11-auto-stop-loss-take-profit/scripts/build.py"],
   "env": {}
@@ -117,7 +130,8 @@ Add to `.cursorrules`:
 ```
 When the user asks about stop-loss, take-profit, forced liquidation, or position sizing for A-shares or futures, use the b11-stop-loss-take-profit skill.
 
-The skill expects 7 input fields per position: code, entry_price, entry_date, current_qty, open_price, available_cash, today.
+Required per-position fields: code, entry_price, entry_date, current_qty, open_price, today, total_equity.
+Optional: multiplier (futures override), holding_trading_days, trade_days.
 
 Run: python3 skill-b11-auto-stop-loss-take-profit/scripts/build.py
 ```
@@ -126,11 +140,9 @@ Run: python3 skill-b11-auto-stop-loss-take-profit/scripts/build.py
 
 ## Hermes
 
-This skill integrates with Hermes as a callable Python module.
+Integrates with Hermes as a callable Python module.
 
 ### Registering the Skill
-
-In your Hermes skill registry:
 
 ```yaml
 # hermes_skills.yml
@@ -141,9 +153,11 @@ skills:
     runtime: python3
     entry: skill-b11-auto-stop-loss-take-profit/scripts/build.py
     description: >
-      Automated stop-loss, take-profit, and position sizing for A-shares and futures.
-      Four-level priority: next-day take-profit (+5%) → next-day stop-loss (-3%) →
-      holding timeout force-close (≥2 days) → single-stock cap (>10%).
+      Enhanced stop-loss, take-profit, forced close, and single-name position cap
+      for A-shares and futures. Trading-day aware via injected
+      holding_trading_days / trade_days or panda_data.get_trade_cal.
+      Five-level priority: guard -> next-day TP (+5%) -> next-day SL (-3%) ->
+      >= 2 trading-day forced close -> notional > 10% total_equity reduce -> hold.
     input_schema:
       type: array
       items:
@@ -152,11 +166,15 @@ skills:
         entry_date: string
         current_qty: integer
         open_price: float
-        available_cash: float
         today: string
+        total_equity: float
+        available_cash: float?      # optional, not the denominator
+        multiplier: float?           # futures override
+        holding_trading_days: int?   # zero-dependency path
+        trade_days: array<string>?   # zero-dependency path
     constraints:
-      - zero third-party dependencies
-      - pure Python standard library
+      - pure Python standard library (math / numbers / re / datetime / bisect)
+      - panda_data only required for the production calendar fallback
       - research and educational use only
 ```
 
@@ -170,7 +188,7 @@ response = hermes.call_skill("b11-auto-stop-loss-take-profit", positions)
 
 ## OpenClaw
 
-This skill can be registered as an OpenClaw tool.
+Register as an OpenClaw tool.
 
 ### Tool Configuration
 
@@ -178,8 +196,9 @@ This skill can be registered as an OpenClaw tool.
 # openclaw_tools.yaml
 - name: stop_loss_take_profit_b11
   description: >
-    Automated stop-loss, take-profit, and position sizing for A-shares and futures.
-    Four-level priority engine with holding-day-aware force close.
+    Enhanced automated stop-loss, take-profit, forced close, and single-name
+    position cap for A-shares and futures. Five-level priority engine with
+    trading-day-aware holding count.
   type: local
   runtime: python3
   entrypoint: skill-b11-auto-stop-loss-take-profit/scripts/build.py
@@ -189,20 +208,25 @@ This skill can be registered as an OpenClaw tool.
       description: List of position snapshots
       items:
         type: object
-        required: [code, entry_price, entry_date, current_qty, open_price, available_cash, today]
+        required: [code, entry_price, entry_date, current_qty, open_price, today, total_equity]
         properties:
-          code: {type: string, description: "Asset code (e.g., 600036, IF2406)"}
-          entry_price: {type: number, description: "Entry price"}
+          code: {type: string, description: "Asset code (e.g., 600036, sh600036, IF2406, rb2410)"}
+          entry_price: {type: number, description: "Entry price (>0, finite)"}
           entry_date: {type: string, description: "Entry date YYYY-MM-DD"}
-          current_qty: {type: integer, description: "Current position quantity"}
-          open_price: {type: number, description: "Today's open price"}
-          available_cash: {type: number, description: "Available cash"}
-          today: {type: string, description: "Current date YYYY-MM-DD"}
+          current_qty: {type: integer, description: "Current position quantity (>=0)"}
+          open_price: {type: number, description: "Today's open price (>0, finite)"}
+          today: {type: string, description: "Current trading date YYYY-MM-DD"}
+          total_equity: {type: number, description: "Total equity — the position-ratio denominator (option A)."}
+          available_cash: {type: number, description: "Optional, kept for backwards compat; NOT used as denominator."}
+          multiplier: {type: number, description: "Optional futures contract multiplier override."}
+          holding_trading_days: {type: integer, description: "Optional trading-day count (zero-dependency path)."}
+          trade_days: {type: array, description: "Optional trading-day sequence (zero-dependency path)."}
   limits:
     max_positions_per_call: 1000
   notes: |
     Research and educational use only. No investment advice.
-    Zero third-party dependencies. Python 3.8+ standard library only.
+    Zero third-party dependencies for injected-calendar paths.
+    Optional panda_data for the production calendar fallback.
 ```
 
 ---
@@ -210,8 +234,9 @@ This skill can be registered as an OpenClaw tool.
 ## Usage Boundaries (All Platforms)
 
 - **Research & educational use only** — not investment advice.
-- Caller supplies all position data; this skill does not fetch market data.
+- Caller supplies all position data; this skill does not fetch market data (only optional calendar lookups via `panda_data`).
 - Long-only; no short/hedge positions.
-- Does not account for price limits, trading halts, liquidity, or slippage.
-- Dates are calendar days; may misjudge holding periods on non-trading days.
-- See `SKILL.md` for full limitations and `README.md` / `README.en.md` for project overview.
+- Does not model price limits, trading halts, liquidity, or slippage.
+- Trading calendar defaults to A-shares (SH exchange); HK / US not supported.
+- Unknown futures symbols require an explicit `multiplier`.
+- See `SKILL.md` for full limitations and `README.md` / `README.en.md` for overview.

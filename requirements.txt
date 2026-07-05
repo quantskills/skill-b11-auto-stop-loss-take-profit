@@ -1,1 +1,15 @@
-# B11 使用纯 Python 标准库，无三方依赖
+# B11 自动止盈止损+仓位管理 — 依赖声明
+#
+# 核心运行时：Python 3.8+ 标准库
+# 使用模块：math, numbers, re, datetime, bisect
+#
+# 可选（仅生产路径需要）：
+#   panda_data — 交易日历兜底数据源
+#   若通过 holding_trading_days / trade_days / config.calendar 注入交易日信息，
+#   则完全无需安装 panda_data；测试与零依赖调用路径皆不依赖任何三方库。
+#
+# 安装 panda_data（生产可选）：
+#   pip install panda_data
+# 并配置环境变量：
+#   PANDA_USERNAME=<your_username>
+#   PANDA_PASSWORD=<your_password>
