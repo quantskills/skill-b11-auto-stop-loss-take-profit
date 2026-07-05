@@ -251,6 +251,5 @@ See `INSTALL.md` for Claude Code, Codex, Cursor, Hermes, and OpenClaw setups.
 
 ## Maintainer
 
-- duanyong <hiduan@qq.com>
 - Upstream org: QuantSkills (<https://github.com/quantskills>)
 - License: GPL-3.0-only (see `LICENSE`).

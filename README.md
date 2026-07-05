@@ -257,6 +257,5 @@ order = run({
 
 ## 维护者
 
-- duanyong <hiduan@qq.com>
 - 上游组织：QuantSkills (<https://github.com/quantskills>)
 - License：GPL-3.0-only（详见 `LICENSE`）

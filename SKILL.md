@@ -13,7 +13,6 @@ metadata:
 ---
 
 ## 维护者
-- duanyong <hiduan@qq.com>
 - 上游组织：QuantSkills (https://github.com/quantskills)
 
 ## ⚠️ 免责声明
