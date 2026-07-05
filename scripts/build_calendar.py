@@ -93,7 +93,21 @@ def build_calendar(years_back=3, years_forward=1, exchange="SH", output_path=Non
     import pyarrow as pa
     import pyarrow.parquet as pq
     table = pa.Table.from_pandas(df)
-    pq.write_table(table, output, compression="snappy")
+    # [H3] 原子写入：先写 .tmp，成功后 os.replace 原子替换目标文件。
+    # 中途失败（进程被 kill / 磁盘满 / pyarrow 崩溃）时原 parquet 完整保留，
+    # 兑现 SKILL.md 承诺"生成过程会覆盖已有 trade.parquet（原子写入，无中间态）"。
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    try:
+        pq.write_table(table, tmp, compression="snappy")
+        os.replace(tmp, output)   # POSIX 保证同一文件系统下的原子替换
+    except Exception:
+        # 清理可能存在的中间 tmp（不影响原文件）
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
 
     file_size = output.stat().st_size
     date_min = int(df["nature_date"].min())

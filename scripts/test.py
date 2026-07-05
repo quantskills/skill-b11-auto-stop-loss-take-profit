@@ -1097,6 +1097,240 @@ def test_check_coverage_swaps_reversed_range():
         os.unlink(p)
 
 
+# ============================================================
+# 硬伤回归测试（H1-H4 / M1-M4）—— 每例针对一个具体审计发现
+# ============================================================
+
+def test_hardbug_h1_entry_price_zero_no_crash():
+    """[H1] 直接调 manage_position(entry_price=0) 不再 ZeroDivisionError，守卫返回 hold。"""
+    r = manage_position(code="600036", entry_price=0.0, entry_date="2026-06-19",
+                        current_qty=800, open_price=10.55, today="2026-06-22",
+                        total_equity=1_000_000)
+    show("H1 entry_price=0", {"action": "hold", "reason~": "entry_price 非正"},
+         {"action": r["action"], "reason": r["reason"]})
+    assert r["action"] == "hold" and "entry_price 非正" in r["reason"], r
+
+
+def test_hardbug_h1_entry_price_negative_no_crash():
+    """[H1] 负 entry_price 也走守卫（不进入 pnl 计算）。"""
+    r = manage_position(code="600036", entry_price=-1.0, entry_date="2026-06-19",
+                        current_qty=800, open_price=10.55, today="2026-06-22",
+                        total_equity=1_000_000)
+    assert r["action"] == "hold" and "entry_price 非正" in r["reason"], r
+
+
+def test_hardbug_h1_nan_price_guard_still_works():
+    """[H1] NaN 价格守卫仍然优先命中（在 entry_price 非正守卫之前）。"""
+    r = manage_position(code="600036", entry_price=float("nan"), entry_date="2026-06-19",
+                        current_qty=800, open_price=10.55, today="2026-06-22",
+                        total_equity=1_000_000)
+    assert r["action"] == "hold" and "NaN" in r["reason"], r
+
+
+def test_hardbug_h2_parquet_string_nature_date_falls_back():
+    """[H2] parquet 的 nature_date 列若是 str "2026-06-19"（模拟 panda_data 未来升级），
+    _load_trade_days_from_parquet 应返回 None 触发回退，而不是 ValueError 崩溃。"""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    import tempfile
+    # 关键：写入 str 而非 int64
+    table = pa.table({"nature_date": ["2026-06-19", "2026-06-22", "2026-06-23"]})
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        pq.write_table(table, f.name)
+        p = f.name
+    try:
+        result = build._load_trade_days_from_parquet(p, "2026-06-22")
+        show("H2 str nature_date 兜底", {"result": None},
+             {"result": result})
+        assert result is None, f"预期 None 让上层回退，实际 {result}"
+    finally:
+        os.unlink(p)
+
+
+def test_hardbug_h3_atomic_write_preserves_original_on_failure():
+    """[H3] build_calendar.build_calendar 中途失败时原 parquet 完整保留（原子写入）。
+    通过 monkey-patch pq.write_table 让其抛异常，验证目标文件未被截断。"""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    try:
+        import pandas as _pd
+    except ImportError:
+        print("    ⏭ pandas 未安装（build_calendar 依赖），跳过")
+        return
+    # panda_data 未安装环境下无法完整走 build_calendar 流程；用 sys.modules 注入 stub
+    import sys as _sys
+    import types as _types
+    _panda_stub_created = False
+    if "panda_data" not in _sys.modules:
+        stub = _types.ModuleType("panda_data")
+        stub.init_token = lambda **kw: None
+        _sys.modules["panda_data"] = stub
+        _panda_stub_created = True
+
+    import tempfile
+    from datetime import date, timedelta
+    _sys.path.insert(0, os.path.dirname(__file__))
+    import build_calendar
+
+    # 先造一份"原始" parquet 作为要保护的目标
+    today = date.today()
+    original_dates = [int((today + timedelta(days=d)).strftime("%Y%m%d")) for d in range(-100, 100, 10)]
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        pq.write_table(pa.table({"nature_date": original_dates}), f.name)
+        target = f.name
+    original_size = os.path.getsize(target)
+
+    # 注入 fake get_trade_cal 返回合法 df
+    fake_df = _pd.DataFrame({
+        "nature_date": [int((today + timedelta(days=d)).strftime("%Y%m%d")) for d in range(-50, 50, 10)],
+        "next_trade_date": ["20260101"] * 10,
+        "pretrade_date": ["20260101"] * 10,
+        "exchange": ["SH"] * 10,
+        "is_trade": [1] * 10,
+    })
+    _pd_mod = _sys.modules["panda_data"]
+    saved_gtc = getattr(_pd_mod, "get_trade_cal", None)
+    _pd_mod.get_trade_cal = lambda **kw: fake_df
+
+    # patch pq.write_table 抛异常（模拟 pyarrow 中途崩溃/磁盘满）
+    saved_wt = pq.write_table
+    def failing_write(*args, **kwargs):
+        raise RuntimeError("模拟 pyarrow 崩溃")
+    pq.write_table = failing_write
+
+    raised = False
+    try:
+        try:
+            build_calendar.build_calendar(years_back=1, years_forward=1, output_path=target)
+        except RuntimeError:
+            raised = True
+
+        # 关键断言：原文件仍在，大小未变（未被截断）
+        assert os.path.exists(target), "H3 原文件被删除！"
+        assert os.path.getsize(target) == original_size, \
+            f"H3 原文件被截断/覆盖：原 {original_size}，现 {os.path.getsize(target)}"
+        # 内容也应可读且不变
+        recovered = pq.read_table(target, columns=["nature_date"]).column("nature_date").to_pylist()
+        assert recovered == original_dates, "H3 原文件内容被破坏"
+        # 且中间 .tmp 已被清理
+        tmp = target + ".tmp"
+        assert not os.path.exists(tmp), f"H3 tmp 文件遗留: {tmp}"
+
+        show("H3 原子写入失败保留原文件",
+             {"raised": True, "file_preserved": True, "size_unchanged": True},
+             {"raised": raised, "size": os.path.getsize(target)})
+        assert raised, "预期 build_calendar 抛异常"
+    finally:
+        pq.write_table = saved_wt
+        if saved_gtc is not None:
+            _pd_mod.get_trade_cal = saved_gtc
+        else:
+            try: delattr(_pd_mod, "get_trade_cal")
+            except AttributeError: pass
+        if _panda_stub_created:
+            _sys.modules.pop("panda_data", None)
+        os.unlink(target)
+
+
+def test_hardbug_h4_today_before_entry_string_guard():
+    """[H4] today < entry_date 字符串守卫：即便两者都在日历外，也返回 hold 不误判。"""
+    r = manage_position(code="600036", entry_price=10.0, entry_date="2020-01-01",
+                        current_qty=800, open_price=10.55, today="2019-12-31",
+                        total_equity=1_000_000)
+    show("H4 today<entry 字符串守卫", {"action": "hold", "reason~": "早于 entry_date"},
+         {"action": r["action"], "reason": r["reason"]})
+    assert r["action"] == "hold" and "早于 entry_date" in r["reason"], r
+
+
+def test_hardbug_m1_current_qty_zero_no_sell_signal():
+    """[M1] current_qty=0 时命中"次日 +5%"不再产出 action=sell,target=0,qty_change=0 空指令。"""
+    r = run(base(current_qty=0, entry_date="2026-06-19", today="2026-06-22", open_price=10.55))
+    show("M1 空仓命中止盈条件", {"action": "hold", "reason~": "空仓"},
+         {"action": r["action"], "target_qty": r["target_qty"],
+          "qty_change": r["qty_change"], "reason": r["reason"]})
+    assert r["action"] == "hold", f"空仓不应产出 sell: {r}"
+    assert r["qty_change"] == 0 and r["target_qty"] == 0
+    assert "空仓" in r["reason"]
+
+
+def test_hardbug_m1_current_qty_zero_no_force_close_signal():
+    """[M1] current_qty=0 且满 2 交易日也不产出强平指令。"""
+    r = run(base(current_qty=0, entry_date="2026-06-19", today="2026-06-23", open_price=10.1))
+    assert r["action"] == "hold" and r["qty_change"] == 0, r
+
+
+def test_hardbug_m2_dot_suffix_a_stock_wind_format():
+    """[M2] Wind 后缀写法 "600036.SH" / "000001.SZ" 判 A股 + 减仓整百。"""
+    for c in ("600036.SH", "000001.SZ", "600036.sh", "000001.sz", "600036.SS"):
+        assert _is_a_stock(c), f"{c} 应判 A股"
+        assert _normalize_code(c) in ("600036", "000001"), _normalize_code(c)
+        assert _get_lot_size(c) == 100
+    # 端到端验证：Wind 写法能走通 run() 且减仓整百
+    inp = base(code="600036.SH", current_qty=2000, open_price=100.0,
+               total_equity=1_000_000, today="2026-06-19")
+    r = run(inp)
+    show("M2 Wind 后缀 A股减仓", {"action": "sell", "target_qty%100": 0},
+         {"action": r["action"], "target_qty": r["target_qty"]})
+    assert r["action"] == "sell" and r["target_qty"] % 100 == 0, r
+
+
+def test_hardbug_m2_normalize_type_error_for_non_str():
+    """[M2] _normalize_code 对非 str 输入抛 TypeError（而非 AttributeError）。"""
+    for bad in (None, 100, 123.45, [], {}):
+        raised = False
+        try:
+            _normalize_code(bad)
+        except TypeError:
+            raised = True
+        assert raised, f"{bad!r} 应抛 TypeError"
+
+
+def test_hardbug_m3_date_no_leading_zero_rejected():
+    """[M3] "2026-6-19" 缺前导零应被 validate_input 拒绝（保护输出契约）。"""
+    for bad_date in ("2026-6-19", "2026-06-1", "2026-6-1", "2026-13-01"):
+        ok, err = validate_input(base(entry_date=bad_date))
+        show(f"M3 拒绝 {bad_date!r}", {"ok": False}, {"ok": ok, "err": err[:60]})
+        assert not ok, f"{bad_date} 应被拒"
+    # today 字段同样严格
+    ok, _ = validate_input(base(today="2026-6-22"))
+    assert not ok
+
+
+def test_hardbug_m3_date_strict_still_accepts_valid():
+    """[M3] 严格正则不误伤合法 YYYY-MM-DD。"""
+    ok, err = validate_input(base(entry_date="2026-06-19", today="2026-06-22"))
+    assert ok, err
+
+
+def test_hardbug_m4_parquet_all_none_nature_date_falls_back():
+    """[M4] nature_date 列全为 None 时返回 None（不再 max() 空序列崩溃）。"""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    import tempfile
+    table = pa.table({"nature_date": [None, None, None]})
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        pq.write_table(table, f.name)
+        p = f.name
+    try:
+        result = build._load_trade_days_from_parquet(p, "2026-06-22")
+        show("M4 全 None 兜底", {"result": None}, {"result": result})
+        assert result is None
+    finally:
+        os.unlink(p)
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("B11 增强版自测")
@@ -1193,6 +1427,21 @@ if __name__ == "__main__":
     test("check 两端超出→extend_both", test_check_coverage_extend_both)
     test("check parquet 缺失→missing", test_check_coverage_missing_parquet)
     test("check 反向区间自动交换", test_check_coverage_swaps_reversed_range)
+
+    print("\n---- 硬伤回归（H1-H4 / M1-M4）----")
+    test("H1 entry_price=0 不崩溃", test_hardbug_h1_entry_price_zero_no_crash)
+    test("H1 entry_price 负值 hold", test_hardbug_h1_entry_price_negative_no_crash)
+    test("H1 NaN 价格仍优先命中", test_hardbug_h1_nan_price_guard_still_works)
+    test("H2 parquet str nature_date 兜底", test_hardbug_h2_parquet_string_nature_date_falls_back)
+    test("H3 原子写入失败保留原文件", test_hardbug_h3_atomic_write_preserves_original_on_failure)
+    test("H4 today<entry 字符串守卫", test_hardbug_h4_today_before_entry_string_guard)
+    test("M1 空仓不产出 sell (TP)", test_hardbug_m1_current_qty_zero_no_sell_signal)
+    test("M1 空仓不产出 sell (强平)", test_hardbug_m1_current_qty_zero_no_force_close_signal)
+    test("M2 .SH/.SZ 后缀 Wind 写法", test_hardbug_m2_dot_suffix_a_stock_wind_format)
+    test("M2 非 str code TypeError", test_hardbug_m2_normalize_type_error_for_non_str)
+    test("M3 日期缺前导零拒绝", test_hardbug_m3_date_no_leading_zero_rejected)
+    test("M3 严格正则不误伤合法", test_hardbug_m3_date_strict_still_accepts_valid)
+    test("M4 全 None nature_date 兜底", test_hardbug_m4_parquet_all_none_nature_date_falls_back)
 
     print("\n" + "=" * 70)
     print(f"{PASS} passed, {FAIL} failed")

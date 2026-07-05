@@ -62,10 +62,24 @@ CLS_FUTURE  = "FUTURE"
 # ============================================================
 
 def _normalize_code(code):
-    """剥离 sh/sz/SH/SZ 交易所前缀（大小写不敏感），返回归一化后的代码主体。"""
+    """
+    剥离交易所前缀/后缀，返回归一化后的代码主体（大小写不敏感）：
+      - 前缀写法：sh600036 / SZ000001 → 600036 / 000001
+      - [M2] 后缀写法（Wind/万得）：600036.SH / 000001.SZ / 600036.SS → 600036 / 000001 / 600036
+      - 其它写法原样返回
+    """
+    if not isinstance(code, str):
+        raise TypeError(f"code 必须是 str，实际 {type(code).__name__}")
     c = code.strip()
+    # 前缀 sh/sz
     m = re.match(r'^(?:sh|sz)(.+)$', c, flags=re.IGNORECASE)
-    return m.group(1) if m else c
+    if m:
+        return m.group(1)
+    # 后缀 .SH/.SZ/.SS（Yahoo/Wind 惯例）
+    m = re.match(r'^(.+)\.(sh|sz|ss)$', c, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return c
 
 
 def _is_a_stock(code):
@@ -189,29 +203,38 @@ def _load_trade_days_from_parquet(parquet_path, today):
     读 trade.parquet 并返回 YYYY-MM-DD 交易日列表。
     - 文件不存在 → None
     - 覆盖不到 today（最晚交易日 < today）→ None，触发回退
-    读盘失败或 schema 异常也返回 None，让上层回退到实时拉取。
+    读盘失败、schema 异常、类型不兼容（如 panda_data 未来把 nature_date
+    改成 str/datetime）、nature_date 全为 None 等一切异常一律返回 None，
+    由上层回退到实时 panda_data.get_trade_cal，保证 SKILL.md 承诺的降级路径生效。
     """
     p = _Path(parquet_path)
     if not p.is_file():
         return None
+    # [H2/M4] 整个类型转换 + max/min 计算全部包在 try 内：
+    # 1) panda_data 未来若把 nature_date 改成 str "2026-06-19" / datetime.date，
+    #    int(x) 会抛 ValueError/TypeError，此处兜底为 None 回退
+    # 2) nature_date 全为 None 时，vals 为空列表，max() 会抛 ValueError，同兜底
     try:
         import pyarrow.parquet as pq
         table = pq.read_table(p, columns=["nature_date"])
         nature_dates = table.column("nature_date").to_pylist()
+        if not nature_dates:
+            return None
+        # nature_date 是 int64 的 YYYYMMDD；转 YYYY-MM-DD 字符串
+        today_int = int(today.replace("-", ""))
+        vals = [int(x) for x in nature_dates if x is not None]
+        if not vals:
+            return None
+        max_date = max(vals)
+        if max_date < today_int:
+            # 缓存过期，让上层拉实时（避免用旧日历漏判未来的交易日）
+            return None
+        return [
+            f"{str(v)[:4]}-{str(v)[4:6]}-{str(v)[6:8]}"
+            for v in vals
+        ]
     except Exception:
         return None
-    if not nature_dates:
-        return None
-    # nature_date 是 int64 的 YYYYMMDD；转 YYYY-MM-DD 字符串
-    today_int = int(today.replace("-", ""))
-    max_date = max(int(x) for x in nature_dates if x is not None)
-    if max_date < today_int:
-        # 缓存过期，让上层拉实时（避免用旧日历漏判未来的交易日）
-        return None
-    return [
-        f"{str(int(x))[:4]}-{str(int(x))[4:6]}-{str(int(x))[6:8]}"
-        for x in nature_dates if x is not None
-    ]
 
 
 # ============================================================
@@ -670,6 +693,13 @@ def validate_input(pos):
         return False, str(e)
 
     # 日期格式
+    # [M3] 前置严格正则：Python strptime 允许 "2026-6-19" 无前导零，会破坏输出契约
+    # （order["time"] 直接回写原字符串，下游依赖 YYYY-MM-DD 严格格式）。
+    _date_re = r'^\d{4}-\d{2}-\d{2}$'
+    if not re.match(_date_re, pos["entry_date"]):
+        return False, f"entry_date 必须严格为 YYYY-MM-DD（含前导零），实际 {pos['entry_date']!r}"
+    if not re.match(_date_re, pos["today"]):
+        return False, f"today 必须严格为 YYYY-MM-DD（含前导零），实际 {pos['today']!r}"
     try:
         entry = datetime.strptime(pos["entry_date"], DATE_FMT)
         today = datetime.strptime(pos["today"], DATE_FMT)
@@ -703,7 +733,9 @@ def manage_position(code, entry_price, entry_date, current_qty, open_price, toda
 
     Returns: dict，8 字段（code/pnl_pct/current_qty/time/action/qty_change/target_qty/reason）。
     """
-    pnl_pct = (open_price - entry_price) / entry_price
+    # pnl_pct 惰性计算：守卫通过后再算，避免 entry_price=0/NaN/inf 触发 ZeroDivisionError / nan 污染。
+    # 守卫失败时 _mk_order 用 pnl_pct=0.0 兜底（reason 里会明确写"价格异常"）。
+    pnl_pct = 0.0
 
     def _mk_order(action, target_qty, reason):
         return {
@@ -718,20 +750,34 @@ def manage_position(code, entry_price, entry_date, current_qty, open_price, toda
         }
 
     # ---- 守卫层（E2/E5）：异常输入一律返回 hold，不进入数值计算 ----
-    # NaN/inf 价格守卫（双保险，validate_input 已拦截，此处兜底直接调用场景）
+    # [H1] 价格守卫必须在 pnl_pct 计算之前：entry_price=0/NaN/inf 一律 hold，避免除零/nan 污染
     if not _finite(entry_price) or not _finite(open_price):
         return _mk_order("hold", current_qty, "[B11]hold 价格为 NaN/inf，跳过")
+    if entry_price <= 0:
+        return _mk_order("hold", current_qty, f"[B11]hold entry_price 非正({entry_price})，跳过")
+    # [H4] today < entry_date 字符串守卫：YYYY-MM-DD 字典序等价时序，防止两者都落在日历外时
+    # bisect 返回 0 误判为"入场当天"。放在交易日历查询之前，避免读盘。
+    if isinstance(today, str) and isinstance(entry_date, str) and today < entry_date:
+        return _mk_order("hold", current_qty,
+                         f"[B11]hold today({today}) 早于 entry_date({entry_date})，异常跳过")
+    # [M1] 空仓短路：current_qty==0 时无操作对象，避免命中 TP/SL/强平后产出
+    # action=sell,target=0,qty_change=0 的无效指令污染下游订单系统
+    if int(current_qty) == 0:
+        return _mk_order("hold", 0, "[B11]hold 空仓，无操作对象")
     # E2：总权益分母 <= 0（含 0 与负权益）短路，防除零
     if not _is_real(total_equity) or math.isnan(float(total_equity)) or math.isinf(float(total_equity)) \
             or total_equity <= 0:
         return _mk_order("hold", current_qty, f"[B11]hold 总权益非正({total_equity})，跳过仓位校验")
+
+    # 守卫通过后再算 pnl（此时 entry_price 保证 >0 且有限）
+    pnl_pct = (open_price - entry_price) / entry_price
 
     # ---- 交易日语义（E1）：唯一来源 panda_data.get_trade_cal ----
     cal = TradingCalendar.from_panda_data(entry_date, today)
     hold_tdays = cal.holding_trading_days(entry_date, today)
     is_next = cal.is_next_day(entry_date, today)
 
-    # E5：today < entry（交易日维度持仓为负）守卫
+    # E5：today < entry（交易日维度持仓为负）守卫（保留作为交易日层面的双保险）
     if hold_tdays < 0:
         return _mk_order("hold", current_qty, f"[B11]hold today 早于 entry_date(交易日数={hold_tdays})，异常跳过")
 
