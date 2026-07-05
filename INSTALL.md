@@ -22,6 +22,13 @@ This package contains 1 QuantSkills skill: `skill-b11-auto-stop-loss-take-profit
    pip install panda_data pyarrow
    ```
 
+   > `panda_data` is a **hard dependency** — the trading calendar has no fallback.
+   > `pyarrow` is a **transitive dependency** shipped by `panda_data`; installing it
+   > explicitly is only needed if you want the parquet cache layer without
+   > `panda_data` at read time. Without `pyarrow`, `build.py` skips the local
+   > `production/trade.parquet` cache and calls `panda_data.get_trade_cal` live on
+   > every run (functionally correct, just slower).
+
 2. **Configure credentials** (one-time env vars; `build.py` auto-calls `init_token`):
 
    ```bash
@@ -63,8 +70,9 @@ After installation, invoke in Claude Code:
 /skill-b11-auto-stop-loss-take-profit
 ```
 
-Requirements: Python 3.8+, `panda_data`, `pyarrow`, and `PANDA_USERNAME` / `PANDA_PASSWORD`
-env vars (see "v2 First-Run Prerequisites" above).
+Requirements: Python 3.8+, `panda_data` (hard dependency), `pyarrow` (transitive
+via `panda_data`; optional cache-layer acceleration), and `PANDA_USERNAME` /
+`PANDA_PASSWORD` env vars (see "v2 First-Run Prerequisites" above).
 
 ---
 
@@ -200,7 +208,8 @@ skills:
         multiplier: float?           # futures override
     constraints:
       - business layer: pure Python stdlib (math / numbers / re / datetime / bisect)
-      - cache layer: panda_data + pyarrow (hard dependency)
+      - calendar layer: panda_data (hard dependency, no fallback)
+      - cache layer: pyarrow (transitive via panda_data; optional acceleration)
       - research and educational use only
 ```
 
@@ -249,7 +258,9 @@ Register as an OpenClaw tool.
     max_positions_per_call: 1000
   notes: |
     Research and educational use only. No investment advice.
-    v2 hard-depends on panda_data + pyarrow; run scripts/build_calendar.py once to warm production/trade.parquet.
+    v2 hard-depends on panda_data (calendar, no fallback); pyarrow is transitive
+    via panda_data and enables the local production/trade.parquet cache. Run
+    scripts/build_calendar.py once to warm the cache.
 ```
 
 ---
@@ -262,5 +273,8 @@ Register as an OpenClaw tool.
 - Does not model price limits, trading halts, liquidity, or slippage.
 - Trading calendar defaults to A-shares (SH exchange); HK / US not supported.
 - Unknown futures symbols require an explicit `multiplier`.
-- v2 requires `panda_data` + `pyarrow` and env credentials on first calendar access; run `scripts/build_calendar.py` once to warm `production/trade.parquet`.
+- v2 requires `panda_data` and env credentials on first calendar access (hard
+  dependency, no fallback). `pyarrow` is optional cache acceleration and comes
+  transitively with `panda_data`. Run `scripts/build_calendar.py` once to warm
+  `production/trade.parquet`.
 - See `SKILL.md` for full limitations and `README.md` / `README.en.md` for overview.
