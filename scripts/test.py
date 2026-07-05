@@ -934,6 +934,169 @@ def test_refresh_calendar_creates_when_missing():
             build_calendar.build_calendar = original_bc
 
 
+# ============================================================
+# check_date_coverage：agent 侧查询 API
+# ============================================================
+
+def _write_fixture_parquet(path, dates_int):
+    """辅助：写一份含 nature_date 列的 parquet。"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    table = pa.table({"nature_date": dates_int})
+    pq.write_table(table, path)
+
+
+def test_check_coverage_in_range():
+    """[API] 查询日期在覆盖内 → in_range=True + suggested_action='ok'。"""
+    try:
+        import pyarrow  # noqa
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    import tempfile
+    from datetime import date, timedelta
+    today = date.today()
+    dates = [int((today + timedelta(days=d)).strftime("%Y%m%d")) for d in range(-365, 400, 10)]
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        _write_fixture_parquet(f.name, dates)
+        p = f.name
+    try:
+        r = build.check_date_coverage(today.strftime("%Y-%m-%d"), parquet_path=p)
+        show("check 范围内", {"in_range": True, "suggested_action": "ok"},
+             {"in_range": r["in_range"], "suggested_action": r["suggested_action"]})
+        assert r["in_range"] is True
+        assert r["suggested_action"] == "ok"
+        assert r["refresh_command"] is None
+        assert r["gap_before"] == 0 and r["gap_after"] == 0
+    finally:
+        os.unlink(p)
+
+
+def test_check_coverage_extend_back():
+    """[API] 查询早于 date_min → extend_back + suggested_years_back 大于当前。"""
+    try:
+        import pyarrow  # noqa
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    import tempfile
+    from datetime import date, timedelta
+    today = date.today()
+    # 只覆盖 today ± 1 年
+    dates = [int((today + timedelta(days=d)).strftime("%Y%m%d")) for d in range(-365, 365, 10)]
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        _write_fixture_parquet(f.name, dates)
+        p = f.name
+    try:
+        # 查询 5 年前的日期
+        query = (today - timedelta(days=365*5)).strftime("%Y-%m-%d")
+        r = build.check_date_coverage(query, parquet_path=p)
+        show("check 早于 date_min", {"in_range": False, "action": "extend_back", "years_back>=5": True},
+             {"in_range": r["in_range"], "suggested_action": r["suggested_action"],
+              "suggested_years_back": r["suggested_years_back"]})
+        assert r["in_range"] is False
+        assert r["suggested_action"] == "extend_back"
+        assert r["gap_before"] > 0 and r["gap_after"] == 0
+        assert r["suggested_years_back"] >= 5
+        assert "refresh_calendar" in r["refresh_command"]
+    finally:
+        os.unlink(p)
+
+
+def test_check_coverage_extend_forward():
+    """[API] 查询晚于 date_max → extend_forward + suggested_years_forward 增大。"""
+    try:
+        import pyarrow  # noqa
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    import tempfile
+    from datetime import date, timedelta
+    today = date.today()
+    dates = [int((today + timedelta(days=d)).strftime("%Y%m%d")) for d in range(-365, 365, 10)]
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        _write_fixture_parquet(f.name, dates)
+        p = f.name
+    try:
+        query = (today + timedelta(days=365*3)).strftime("%Y-%m-%d")
+        r = build.check_date_coverage(query, parquet_path=p)
+        show("check 晚于 date_max", {"in_range": False, "action": "extend_forward"},
+             {"in_range": r["in_range"], "suggested_action": r["suggested_action"],
+              "suggested_years_forward": r["suggested_years_forward"]})
+        assert r["in_range"] is False
+        assert r["suggested_action"] == "extend_forward"
+        assert r["gap_after"] > 0 and r["gap_before"] == 0
+        assert r["suggested_years_forward"] >= 3
+    finally:
+        os.unlink(p)
+
+
+def test_check_coverage_extend_both():
+    """[API] 区间两端都超出 → extend_both + 建议同时扩展。"""
+    try:
+        import pyarrow  # noqa
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    import tempfile
+    from datetime import date, timedelta
+    today = date.today()
+    dates = [int((today + timedelta(days=d)).strftime("%Y%m%d")) for d in range(-180, 180, 10)]
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        _write_fixture_parquet(f.name, dates)
+        p = f.name
+    try:
+        s = (today - timedelta(days=365*3)).strftime("%Y-%m-%d")
+        e = (today + timedelta(days=365*3)).strftime("%Y-%m-%d")
+        r = build.check_date_coverage(s, e, parquet_path=p)
+        show("check 两端超出", {"action": "extend_both"},
+             {"action": r["suggested_action"],
+              "back": r["suggested_years_back"], "forward": r["suggested_years_forward"]})
+        assert r["suggested_action"] == "extend_both"
+        assert r["gap_before"] > 0 and r["gap_after"] > 0
+        assert r["suggested_years_back"] >= 3
+        assert r["suggested_years_forward"] >= 3
+    finally:
+        os.unlink(p)
+
+
+def test_check_coverage_missing_parquet():
+    """[API] parquet 缺失 → suggested_action='missing' + 给出兜底建议。"""
+    r = build.check_date_coverage("2025-01-15", parquet_path="/nonexistent/trade.parquet")
+    show("check 缺失", {"action": "missing", "in_range": False},
+         {"action": r["suggested_action"], "in_range": r["in_range"]})
+    assert r["in_range"] is False
+    assert r["suggested_action"] == "missing"
+    assert r["coverage"]["date_min"] is None
+    assert "refresh_calendar" in r["refresh_command"] or "build_calendar" in r["refresh_command"]
+
+
+def test_check_coverage_swaps_reversed_range():
+    """[API] 用户传 start > end 时自动交换而不是报错。"""
+    try:
+        import pyarrow  # noqa
+    except ImportError:
+        print("    ⏭ pyarrow 未安装，跳过")
+        return
+    import tempfile
+    from datetime import date, timedelta
+    today = date.today()
+    dates = [int((today + timedelta(days=d)).strftime("%Y%m%d")) for d in range(-365, 400, 10)]
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        _write_fixture_parquet(f.name, dates)
+        p = f.name
+    try:
+        # 反向传入
+        s = (today + timedelta(days=100)).strftime("%Y-%m-%d")
+        e = (today - timedelta(days=100)).strftime("%Y-%m-%d")
+        r = build.check_date_coverage(s, e, parquet_path=p)
+        # 归一化后 query.start 应 <= query.end
+        assert r["query"]["start_date"] <= r["query"]["end_date"]
+        assert r["in_range"] is True   # 两端都在覆盖内
+    finally:
+        os.unlink(p)
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("B11 增强版自测")
@@ -1022,6 +1185,14 @@ if __name__ == "__main__":
     test("refresh ok 时跳过", test_refresh_calendar_skips_when_ok)
     test("refresh force 触发重跑", test_refresh_calendar_force_triggers_rebuild)
     test("refresh 缺失时自动创建", test_refresh_calendar_creates_when_missing)
+
+    print("\n---- Agent 侧 API：check_date_coverage ----")
+    test("check 范围内→in_range", test_check_coverage_in_range)
+    test("check 早于 date_min→extend_back", test_check_coverage_extend_back)
+    test("check 晚于 date_max→extend_forward", test_check_coverage_extend_forward)
+    test("check 两端超出→extend_both", test_check_coverage_extend_both)
+    test("check parquet 缺失→missing", test_check_coverage_missing_parquet)
+    test("check 反向区间自动交换", test_check_coverage_swaps_reversed_range)
 
     print("\n" + "=" * 70)
     print(f"{PASS} passed, {FAIL} failed")

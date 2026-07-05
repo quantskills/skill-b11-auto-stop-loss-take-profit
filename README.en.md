@@ -3,6 +3,7 @@
 Automated stop-loss, take-profit, and single-name position-cap management for A-shares and futures. Supports next-day gap-up take-profit (+5%), next-day gap-down stop-loss (-3%), forced liquidation once holding spans ≥ 2 trading days, and reduce-to-cap when a single name's notional exceeds 10% of total equity. Emits the standard 8-field position adjustment order.
 
 > This release is the **enhanced fix** of the previous 52/100 audited version, addressing all six identified defects (E1–E6). **v2 upgrades this BUILD to a hybrid type** — the shipped `production/trade.parquet` cache backs the trading calendar, and two new agent-facing APIs (`inspect_calendar()` / `refresh_calendar()`) let higher-level agents own the cache lifecycle.
+> **v3 adds** `check_date_coverage(start_date, end_date=None)` — a single call that returns whether any date / backtest range is covered by the calendar, the natural-day gap, extension advice, and a ready-to-run `refresh_command`.
 
 ## ⚠️ Disclaimer
 
@@ -21,8 +22,8 @@ Automated stop-loss, take-profit, and single-name position-cap management for A-
 ├── INSTALL.md                              ← 5-platform install guide
 ├── requirements.txt                        ← dependency notes (panda_data required + pyarrow)
 ├── scripts/
-│   ├── build.py                            ← main entry (run / validate_input / inspect_calendar / refresh_calendar)
-│   ├── test.py                             ← self-test (62 cases)
+│   ├── build.py                            ← main entry (run / validate_input / check_date_coverage / inspect_calendar / refresh_calendar)
+│   ├── test.py                             ← self-test (68 cases)
 │   ├── build_calendar.py                   ← standalone bootstrap: fetch calendar → write production/trade.parquet
 │   └── _verify_prod.py                     ← production-path verifier
 ├── references/
@@ -37,7 +38,7 @@ Automated stop-loss, take-profit, and single-name position-cap management for A-
 # 1) Bootstrap the trading-calendar cache (first run only; needs PANDA_USERNAME/PANDA_PASSWORD)
 python3 scripts/build_calendar.py
 
-# 2) Unit tests (no external data required, 62 cases)
+# 2) Unit tests (no external data required, 68 cases)
 python3 scripts/test.py
 
 # 3) Main entry demo
@@ -49,24 +50,39 @@ python3 scripts/_verify_prod.py
 
 ## Agent Usage
 
-v2 introduces two agent-facing APIs so higher-level agents can own calendar-cache lifecycle decisions:
+Since v3 the recommended agent entry is `check_date_coverage` — one call gives range + coverage + advice + a ready-to-run refresh command:
 
 ```python
-from scripts.build import inspect_calendar, refresh_calendar, run
+from scripts.build import check_date_coverage, refresh_calendar, run
 
-# 1) Read-only inspection: cached range, day count, mtime
-info = inspect_calendar()
-# {'first_date': '2022-07-05', 'last_date': '2027-07-06', 'total_days': 971, 'mtime': '...'}
+# 1) One-shot query: agent asks the calendar about any unknown date
+r = check_date_coverage("2020-01-15")   # or ("2020-01-15", "2029-06-01") for a range
+# {'in_range': False, 'coverage': 'before_min',
+#  'suggested_years_back': 6, 'suggested_years_forward': 1,
+#  'suggested_action': 'refresh',
+#  'refresh_command': 'refresh_calendar(force=True, years_back=6, years_forward=1)', ...}
 
-# 2) On-demand refresh: force=False skips when the range is still covered; True refetches
-refresh_calendar(force=False)
+# 2) Extend cache per suggestion (agent can literally copy refresh_command)
+if r["suggested_action"] == "refresh":
+    refresh_calendar(force=True,
+                     years_back=r["suggested_years_back"],
+                     years_forward=r["suggested_years_forward"])
 
 # 3) Regular invocation
 order = run(pos={"code": "600519", "entry_date": "2025-01-02", ...},
             config={"total_equity": 1_000_000})
 ```
 
-Full 4-step SOP and 7-scenario decision table are in `SKILL.md` § Agent SOP.
+Underlying `inspect_calendar()` (read-only health check) and `refresh_calendar(force, years_back, years_forward)` (idempotent refresh) remain available. Full three-layer SOP and 7-scenario decision table are in `SKILL.md` § Agent SOP.
+
+## v3 Changelog
+
+Four changes since v2 (commit `abf1227`):
+
+1. **New `check_date_coverage(start_date, end_date=None)` public API.** The recommended agent entry point: returns `in_range` / `coverage` / `gap_before` / `gap_after` / `suggested_years_back` / `suggested_years_forward` / `suggested_action` / `refresh_command` / `reason` in a single call.
+2. **Three-layer agent SOP** — `check_date_coverage` (query + advice) → `inspect_calendar` (health) → `refresh_calendar` (refresh). `SKILL.md` documents when to use each layer.
+3. **Tests expanded 62 → 68.** Six new cases covering `check_date_coverage` (in-range, before `date_min`, after `date_max`, both ends out, missing parquet fallback, reversed range auto-swap).
+4. **`production/trade.parquet` and all v2 behaviour preserved** — agents remain out-of-the-box.
 
 ## v2 Changelog
 
@@ -97,7 +113,7 @@ See `INSTALL.md` for Claude Code, Codex, Cursor, Hermes, and OpenClaw setups.
 
 ## Acceptance
 
-- **Tests**: `scripts/test.py` — **62 / 62 passing** (happy path, edge cases, exceptional input, E1–E6, plus v2 parquet-cache / `inspect_calendar` / `refresh_calendar`).
+- **Tests**: `scripts/test.py` — **68 / 68 passing** (happy path, edge cases, exceptional input, E1–E6, v2 parquet-cache / `inspect_calendar` / `refresh_calendar`, plus v3 `check_date_coverage` coverage).
 - **Enhancements delivered**:
   - E1 trading-day semantics (`panda_data.get_trade_cal` as sole source) ✅
   - E2 denominator switched to `total_equity` ✅

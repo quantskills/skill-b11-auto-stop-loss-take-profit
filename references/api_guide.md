@@ -46,11 +46,45 @@ from scripts.build import run, validate_input
 - **入参**：`dict`
 - **返回**：`(bool, str)` — (是否通过, 错误信息)
 
-### `inspect_calendar(parquet_path=None)` ⭐ agent 侧探查
+### `check_date_coverage(start_date, end_date=None, parquet_path=None)` ⭐ agent 侧首选入口
 
-只读检查 `trade.parquet` 状态，供 agent 决定是否需要更新。
+**一次调用即可获得「查询 + 判定 + 建议命令」**，agent 拿到任意日期或区间后先调它。
 
-**入参**：`parquet_path`（可选）—— 自定义 parquet 位置；缺省用默认 `生产产物/trade.parquet`
+**入参**：
+- `start_date`：`"YYYY-MM-DD"`，单点或区间起点
+- `end_date`（可选）：`"YYYY-MM-DD"`，区间终点；缺省视为单点查询
+- `parquet_path`（可选）：自定义 parquet 位置
+
+**返回**：dict
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `query` | dict | `{start_date, end_date}` — 归一化后的查询区间 |
+| `coverage` | dict | `{date_min, date_max, count}` — 当前日历实际范围 |
+| `in_range` | bool | 查询区间是否**完全落在**当前覆盖内 |
+| `gap_before` | int | 起点早于 `date_min` 的自然日数（0 = 不缺） |
+| `gap_after` | int | 终点晚于 `date_max` 的自然日数（0 = 不缺） |
+| `suggested_years_back` | int\|None | 建议给 `refresh_calendar` 的 `years_back`（已含 1 年冗余） |
+| `suggested_years_forward` | int\|None | 建议给 `refresh_calendar` 的 `years_forward` |
+| `suggested_action` | str | `"ok"` / `"extend_back"` / `"extend_forward"` / `"extend_both"` / `"missing"` |
+| `refresh_command` | str\|None | 可直接执行的 Python 调用字符串（`in_range=True` 时为 None） |
+| `reason` | str | 人类可读的判定说明 |
+
+**典型 agent 用法**：
+
+```python
+r = check_date_coverage("2020-01-15")   # 或区间 check_date_coverage("2020-01-15", "2029-06-01")
+if not r["in_range"]:
+    refresh_calendar(force=True,
+                     years_back=r["suggested_years_back"],
+                     years_forward=r["suggested_years_forward"])
+```
+
+### `inspect_calendar(parquet_path=None)` — 只读探查
+
+只读检查 `trade.parquet` 状态。返回 dict 见下方；`check_date_coverage` 内部已封装它，独立调用适合定时健康检查场景。
+
+**入参**：`parquet_path`（可选）—— 自定义 parquet 位置
 
 **返回**：dict
 
@@ -67,7 +101,7 @@ from scripts.build import run, validate_input
 | `recommendation` | str | `"ok"` / `"refresh_recommended"` / `"refresh_required"` / `"missing"` |
 | `reason` | str | 判定原因（人类可读） |
 
-### `refresh_calendar(force=False, years_back=3, years_forward=1, exchange="SH", parquet_path=None)` ⭐ agent 侧更新
+### `refresh_calendar(force=False, years_back=3, years_forward=1, exchange="SH", parquet_path=None)` — 按需刷新
 
 检查并按需刷新 `trade.parquet`。
 
@@ -75,7 +109,7 @@ from scripts.build import run, validate_input
 - 缺失/过期/`days_to_expiry < 30` → 自动刷新
 - 否则跳过
 
-**参数**：与 `build_calendar.py --years-back / --years-forward / --exchange / --output` 一致
+**扩展范围**：`check_date_coverage` 给出 `suggested_years_back` / `suggested_years_forward` 后，用 `refresh_calendar(force=True, years_back=X, years_forward=Y)` 触发。
 
 **返回**：dict
 

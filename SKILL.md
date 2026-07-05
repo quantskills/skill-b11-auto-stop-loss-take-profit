@@ -248,46 +248,61 @@ python3 scripts/build_calendar.py --exchange SH
 
 #### Agent 更新 SOP ⭐（**其它 AI/agent 使用本 skill 前必读**）
 
-`build.py` 已提供**两个公开 API** 供 agent 判断和执行更新：
+`build.py` 提供 **3 个公开 API**，覆盖 agent 侧「查询范围 → 判定过期 → 按需刷新」全链路：
 
 ```python
-from scripts.build import inspect_calendar, refresh_calendar
+from scripts.build import check_date_coverage, inspect_calendar, refresh_calendar
 ```
 
-##### 步骤 1 — inspect_calendar()  只读检查
-返回 dict 含 7 项状态字段。agent 根据 `recommendation` 字段决定后续动作：
+##### 步骤 0 — check_date_coverage(date_or_start, end_date=None) ⭐ 首选入口
+
+**agent 拿到某个 entry_date/today（或回测起止区间）后，先调它就能一键知道「范围够不够 + 该如何扩展」**。
+
+返回 dict 关键字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `in_range` | bool | 查询区间是否**完全落在**当前 parquet 覆盖内 |
+| `coverage` | dict | `{date_min, date_max, count}` — 当前日历实际范围 |
+| `gap_before` | int | 查询起点早于 `date_min` 的自然日数（0 = 不缺） |
+| `gap_after` | int | 查询终点晚于 `date_max` 的自然日数（0 = 不缺） |
+| `suggested_years_back` | int | 建议给 `refresh_calendar` 的 `years_back`（含 1 年冗余） |
+| `suggested_years_forward` | int | 建议给 `refresh_calendar` 的 `years_forward`（含 1 年冗余） |
+| `suggested_action` | str | `ok` / `extend_back` / `extend_forward` / `extend_both` / `missing` |
+| `refresh_command` | str\|None | 可**直接照抄执行**的 Python 调用字符串 |
+| `reason` | str | 人类可读的判定说明 |
+
+**典型 agent 流程**（3 行代码）：
+
+```python
+r = check_date_coverage("2020-01-15")     # agent 场景的实际日期
+if not r["in_range"]:
+    refresh_calendar(force=True,
+                     years_back=r["suggested_years_back"],
+                     years_forward=r["suggested_years_forward"])
+# 之后可放心调 run() 走交易决策
+```
+
+**区间查询**：`check_date_coverage("2020-01-15", "2029-06-01")` 一次判定回测起止是否都覆盖。
+
+##### 步骤 1 — inspect_calendar()  只读状态检查
+`check_date_coverage` 内部已用它。**独立调用场景**：定时任务只想知道「日历健康度」（快过期没）。返回 dict 关键字段 `recommendation` 值：
 
 | `recommendation` 值 | 含义 | agent 应做 |
 |---|---|---|
 | `"ok"` | 缓存正常，`date_max` 距 today ≥ 30 自然日 | 无需动作 |
-| `"refresh_recommended"` | 缓存 <30 自然日过期 | 建议调 `refresh_calendar()` |
+| `"refresh_recommended"` | 缓存 <30 自然日过期 | 建议调 `refresh_calendar()` 静默刷新 |
 | `"refresh_required"` | 已过期 / 空 / 读盘失败 | **必须**调 `refresh_calendar(force=True)` 或让实时 API 兜底 |
 | `"missing"` | 文件不存在 | 首次运行 `python3 scripts/build_calendar.py` |
 
-返回示例：
-```python
-{
-    "exists": True,
-    "path": ".../生产产物/trade.parquet",
-    "count": 971,
-    "date_min": "2023-07-06",
-    "date_max": "2027-07-05",
-    "today": "2026-07-05",
-    "covers_today": True,
-    "days_to_expiry": 365,
-    "recommendation": "ok",
-    "reason": "缓存正常（date_max=2027-07-05，余 365 自然日）。",
-}
-```
-
-##### 步骤 2 — refresh_calendar(force=False)  按需刷新
+##### 步骤 2 — refresh_calendar(force=False, years_back=3, years_forward=1)
 
 内置判定规则（`force=False` 时）：
 - 缺失 或 `date_max < today` → 自动刷新
 - `days_to_expiry < 30` → 自动刷新（预防长假前失效）
 - 否则 → 跳过（`updated=False`）
 
-传 `force=True` 无条件刷新。
+**扩展历史/未来时必须传 `force=True` + 自定义 `years_back` / `years_forward`**（`check_date_coverage` 已算好建议值）。
 
 返回示例：
 ```python
@@ -302,14 +317,15 @@ from scripts.build import inspect_calendar, refresh_calendar
 
 ##### 步骤 3 — 触发条件与推荐节奏
 
-| 触发场景 | 推荐动作 |
+| 触发场景 | agent 推荐动作 |
 |---|---|
+| **拿到未知日期（entry_date/回测区间）** | `check_date_coverage(date)` 一步到位 |
 | **首次部署 skill** | `python3 scripts/build_calendar.py` 一次性生成 |
 | **每日启动交易 agent 时** | `inspect_calendar()` 只读检查（微秒级） |
 | **发现 `refresh_recommended`** | 调 `refresh_calendar()` 静默刷新 |
 | **发现 `refresh_required`** | 调 `refresh_calendar(force=True)` |
+| **回测跨越较早年份** | `check_date_coverage(backtest_start, backtest_end)` → 按 suggested_* 扩展 |
 | **长假前（春节/国庆前 1-2 周）** | 主动 `refresh_calendar(force=True)` 拉最新日历 |
-| **panda_data 返回 schema 有新增列** | 无需操作（`build.py` 只依赖 `nature_date` 列） |
 | **panda_data 变更 `nature_date` 类型** | 需同步修改 `_load_trade_days_from_parquet` 的转换逻辑 |
 | **CI/定时任务** | 每季度 `refresh_calendar(force=True)` |
 

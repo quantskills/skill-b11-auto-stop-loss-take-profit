@@ -3,6 +3,7 @@
 当需要对 A 股和期货持仓做自动止盈止损与仓位管理时，使用此 skill。支持次日高开止盈（+5%）、次日低开止损（-3%）、持仓满 2 交易日强平、单票名义仓位上限（>10%）减仓，输出标准 8 字段调仓指令。
 
 > 本版本为对 52/100 验收版的**增强修复**，全面落地 6 项缺陷改进（E1–E6），**v2 已升级为混合型 BUILD**——生产产物 `production/trade.parquet` 提供本地交易日历缓存，agent 侧新增 `inspect_calendar()` / `refresh_calendar()` 自主决策 API。
+> **v3 追加**：新增 `check_date_coverage(start_date, end_date=None)` 一键查询 API——agent 拿到任意日期或回测区间，一次调用即返回「是否在日历覆盖范围内 + 缺口 + 扩展建议 + 可直接执行的 refresh 命令」。
 
 ## ⚠️ 免责声明
 
@@ -21,8 +22,8 @@
 ├── INSTALL.md                              ← 多平台安装指南（5 平台）
 ├── requirements.txt                        ← 依赖声明（panda_data 硬依赖 + pyarrow）
 ├── scripts/
-│   ├── build.py                            ← 主入口（run / validate_input / inspect_calendar / refresh_calendar）
-│   ├── test.py                             ← 自测脚本（62 用例）
+│   ├── build.py                            ← 主入口（run / validate_input / check_date_coverage / inspect_calendar / refresh_calendar）
+│   ├── test.py                             ← 自测脚本（68 用例）
 │   ├── build_calendar.py                   ← 独立初始化：拉取交易日历 → 写 production/trade.parquet
 │   └── _verify_prod.py                     ← 生产路径验证（panda_data 实测）
 ├── references/
@@ -37,7 +38,7 @@
 # 一：初始化交易日历缓存（首次使用必做，需 PANDA_USERNAME/PANDA_PASSWORD）
 python3 scripts/build_calendar.py
 
-# 二：单元测试（零外部数据依赖，62 用例）
+# 二：单元测试（零外部数据依赖，68 用例）
 python3 scripts/test.py
 
 # 三：build 主入口示例
@@ -49,24 +50,38 @@ python3 scripts/_verify_prod.py
 
 ## Agent 使用示例
 
-v2 新增两个 agent 侧公开 API，供上层 agent 自主决策日历更新时机：
+v3 起，agent 侧首选入口是 `check_date_coverage`——一次调用拿齐范围/覆盖/建议/命令：
 
 ```python
-from scripts.build import inspect_calendar, refresh_calendar, run
+from scripts.build import check_date_coverage, refresh_calendar, run
 
-# 1. 只读探查：查看当前缓存的日期范围、覆盖天数、最后更新时间
-info = inspect_calendar()
-# {'first_date': '2022-07-05', 'last_date': '2027-07-06', 'total_days': 971, 'mtime': '...'}
+# 1. 一键查询：agent 拿到未知日期先问日历
+r = check_date_coverage("2020-01-15")   # 或 ("2020-01-15", "2029-06-01") 查区间
+# {'in_range': False, 'coverage': 'before_min',
+#  'suggested_years_back': 6, 'suggested_years_forward': 1,
+#  'suggested_action': 'refresh', 'refresh_command': 'refresh_calendar(force=True, years_back=6, years_forward=1)', ...}
 
-# 2. 按需刷新：force=False 时智能跳过（仍在覆盖范围内），True 强制重拉
-refresh_calendar(force=False)
+# 2. 按建议扩容（agent 只需照抄 refresh_command）
+if r["suggested_action"] == "refresh":
+    refresh_calendar(force=True,
+                     years_back=r["suggested_years_back"],
+                     years_forward=r["suggested_years_forward"])
 
 # 3. 正常调用主入口
 order = run(pos={"code": "600519", "entry_date": "2025-01-02", ...},
             config={"total_equity": 1_000_000})
 ```
 
-完整 4 步 SOP 与 7 种触发场景决策表见 `SKILL.md` § Agent 更新 SOP。
+底层仍提供 `inspect_calendar()`（只读健康检查）/ `refresh_calendar(force, years_back, years_forward)`（按需刷新）——完整三层 SOP 与 7 种触发场景决策表见 `SKILL.md` § Agent 更新 SOP。
+
+## v3 更新记录
+
+相对 v2（commit `abf1227`）的 4 项主要变更：
+
+1. **新增 `check_date_coverage(start_date, end_date=None)` 公开 API**：agent 侧首选入口，一次调用即可拿到「日历范围 + 是否覆盖 + 缺口自然日数 + 扩展建议 + 可直接执行的 refresh 命令」，字段包含 `in_range` / `coverage` / `gap_before` / `gap_after` / `suggested_years_back` / `suggested_years_forward` / `suggested_action` / `refresh_command` / `reason`。
+2. **三层 agent SOP 完善**：`check_date_coverage`（查询 + 建议）→ `inspect_calendar`（健康检查）→ `refresh_calendar`（按需刷新）。`SKILL.md` 详细写明每层使用场景。
+3. **测试 62 → 68 例**：新增 6 例 `check_date_coverage` 用例（范围内 / 早于 `date_min` / 晚于 `date_max` / 两端超出 / parquet 缺失回退 / 反向区间自动交换）。
+4. **保留 `production/trade.parquet` 数据源与全部 v2 行为**，agent 开箱即用。
 
 ## v2 更新记录
 
@@ -103,7 +118,7 @@ order = run(pos={"code": "600519", "entry_date": "2025-01-02", ...},
 
 ## 验收状态
 
-- **测试**：`scripts/test.py` — **62 / 62 用例通过**（正常流、边界值、异常输入、增强项 E1–E6、v2 parquet cache / inspect / refresh 全覆盖）。
+- **测试**：`scripts/test.py` — **68 / 68 用例通过**（正常流、边界值、异常输入、增强项 E1–E6、v2 parquet cache / inspect / refresh 全覆盖，v3 新增 6 例 check_date_coverage 覆盖）。
 - **增强改进落地**：
   - E1 交易日语义（`panda_data.get_trade_cal` 唯一来源） ✅
   - E2 仓位分母改为 `total_equity` ✅

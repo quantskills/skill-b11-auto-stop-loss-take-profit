@@ -363,6 +363,151 @@ def refresh_calendar(force=False, years_back=3, years_forward=1,
     }
 
 
+def check_date_coverage(start_date, end_date=None, parquet_path=None):
+    """
+    检查一个日期或日期区间是否落在当前 trade.parquet 交易日历范围内；不在范围时给出
+    agent 可直接执行的扩展建议。这是 agent 侧最常用的入口 —— 单次调用即可获取
+    「查询 + 判定 + 建议命令」。
+
+    Args:
+        start_date: 日期字符串 YYYY-MM-DD（单点查询）；或区间起点
+        end_date:   区间终点 YYYY-MM-DD；None 时视为单点查询（等价 end_date=start_date）
+        parquet_path: 自定义 parquet 位置；None 用默认 生产产物/trade.parquet
+
+    Returns: dict
+        {
+            "query":         {"start_date", "end_date"},      # 用户查询的区间（归一化）
+            "coverage":      {"date_min", "date_max", "count"},  # 当前日历覆盖
+            "in_range":      bool,                            # 查询区间是否完全落在覆盖内
+            "gap_before":    int,                             # 需向前扩展的自然日数（0 = 无需）
+            "gap_after":     int,                             # 需向后扩展的自然日数（0 = 无需）
+            "suggested_years_back":    int,                   # 建议 refresh_calendar 传的 years_back
+            "suggested_years_forward": int,                   # 建议 refresh_calendar 传的 years_forward
+            "suggested_action": str,                          # "ok" | "extend_back" | "extend_forward" |
+                                                              # "extend_both" | "missing"
+            "refresh_command":  str,                          # agent 可直接执行的 Python 调用
+            "reason":         str,                            # 判定说明（人类可读）
+        }
+
+    典型用法：
+        r = check_date_coverage("2020-01-05")
+        if not r["in_range"]:
+            refresh_calendar(force=True,
+                             years_back=r["suggested_years_back"],
+                             years_forward=r["suggested_years_forward"])
+    """
+    from datetime import date as _date, datetime as _dt
+
+    if end_date is None:
+        end_date = start_date
+    if start_date > end_date:
+        # 兼容用户传反，交换而不是报错
+        start_date, end_date = end_date, start_date
+
+    query = {"start_date": start_date, "end_date": end_date}
+
+    info = inspect_calendar(parquet_path)
+    if not info["exists"] or info["count"] == 0:
+        # parquet 不存在：所有日期都不在范围内
+        s_dt = _dt.strptime(start_date, "%Y-%m-%d").date()
+        e_dt = _dt.strptime(end_date, "%Y-%m-%d").date()
+        today = _date.today()
+        years_back = max(1, (today - s_dt).days // 365 + 1) if s_dt < today else 3
+        years_forward = max(1, (e_dt - today).days // 365 + 1) if e_dt > today else 1
+        return {
+            "query": query,
+            "coverage": {"date_min": None, "date_max": None, "count": 0},
+            "in_range": False,
+            "gap_before": None, "gap_after": None,
+            "suggested_years_back": years_back,
+            "suggested_years_forward": years_forward,
+            "suggested_action": "missing",
+            "refresh_command": (
+                f"refresh_calendar(force=True, "
+                f"years_back={years_back}, years_forward={years_forward})"
+            ),
+            "reason": (
+                "trade.parquet 不存在。运行 refresh_calendar(force=True, ...) 或 "
+                "`python3 scripts/build_calendar.py --years-back N --years-forward M` 生成。"
+            ),
+        }
+
+    date_min = info["date_min"]
+    date_max = info["date_max"]
+    coverage = {"date_min": date_min, "date_max": date_max, "count": info["count"]}
+
+    s_dt = _dt.strptime(start_date, "%Y-%m-%d").date()
+    e_dt = _dt.strptime(end_date, "%Y-%m-%d").date()
+    min_dt = _dt.strptime(date_min, "%Y-%m-%d").date()
+    max_dt = _dt.strptime(date_max, "%Y-%m-%d").date()
+
+    gap_before = max(0, (min_dt - s_dt).days)   # start 早于 min 的自然日数
+    gap_after = max(0, (e_dt - max_dt).days)    # end 晚于 max 的自然日数
+
+    if gap_before == 0 and gap_after == 0:
+        return {
+            "query": query,
+            "coverage": coverage,
+            "in_range": True,
+            "gap_before": 0, "gap_after": 0,
+            "suggested_years_back": None,
+            "suggested_years_forward": None,
+            "suggested_action": "ok",
+            "refresh_command": None,
+            "reason": f"查询区间 {start_date} .. {end_date} 已在覆盖 {date_min} .. {date_max} 内。",
+        }
+
+    # 计算需要扩展的年数（向上取整 + 冗余 1 年，避免频繁扩展）
+    today = _date.today()
+    current_years_back = max(1, (today - min_dt).days // 365)
+    current_years_forward = max(1, (max_dt - today).days // 365)
+
+    if gap_before > 0:
+        # 需要更多历史：从 today 到 start_date 的年数 + 1 年冗余
+        need_years_back = (today - s_dt).days // 365 + 1
+        suggested_years_back = max(current_years_back, need_years_back)
+    else:
+        suggested_years_back = current_years_back
+
+    if gap_after > 0:
+        need_years_forward = (e_dt - today).days // 365 + 1
+        suggested_years_forward = max(current_years_forward, need_years_forward)
+    else:
+        suggested_years_forward = current_years_forward
+
+    if gap_before > 0 and gap_after > 0:
+        action = "extend_both"
+    elif gap_before > 0:
+        action = "extend_back"
+    else:
+        action = "extend_forward"
+
+    refresh_command = (
+        f"refresh_calendar(force=True, "
+        f"years_back={suggested_years_back}, years_forward={suggested_years_forward})"
+    )
+
+    parts = []
+    if gap_before > 0:
+        parts.append(f"start={start_date} 早于 date_min={date_min}（缺 {gap_before} 天）")
+    if gap_after > 0:
+        parts.append(f"end={end_date} 晚于 date_max={date_max}（缺 {gap_after} 天）")
+    reason = "；".join(parts) + f"。建议：{refresh_command}"
+
+    return {
+        "query": query,
+        "coverage": coverage,
+        "in_range": False,
+        "gap_before": gap_before,
+        "gap_after": gap_after,
+        "suggested_years_back": suggested_years_back,
+        "suggested_years_forward": suggested_years_forward,
+        "suggested_action": action,
+        "refresh_command": refresh_command,
+        "reason": reason,
+    }
+
+
 class TradingCalendar:
     """
     交易日历。唯一来源：panda_data.get_trade_cal（或其 parquet 缓存）。
