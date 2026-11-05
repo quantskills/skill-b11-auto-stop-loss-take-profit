@@ -361,3 +361,7 @@ TradingCalendar.from_panda_data(entry_date, today)
 3. 仅支持多头持仓
 4. 内置期货乘数表覆盖常见品种，未知品种须由调用方传 multiplier
 5. 首次调用需网络与 panda_data 服务可达；后续调用会命中模块级登录标记，同一进程内不重复登录
+
+## Pandadata compatibility
+
+[Pandadata 1.0.6 compatibility](references/pandadata-compatibility.md) — exact SDK baseline, validation scope, and shared guidance for all supported agent runtimes.

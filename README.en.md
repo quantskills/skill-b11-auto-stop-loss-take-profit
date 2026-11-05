@@ -253,3 +253,6 @@ See `INSTALL.md` for Claude Code, Codex, Cursor, Hermes, and OpenClaw setups.
 
 - Upstream org: QuantSkills (<https://github.com/quantskills>)
 - License: GPL-3.0-only (see `LICENSE`).
+
+
+Pandadata compatibility maintenance: [abgyjaguo](https://github.com/abgyjaguo). Existing authorship is retained.
