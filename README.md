@@ -259,3 +259,6 @@ order = run({
 
 - 上游组织：QuantSkills (<https://github.com/quantskills>)
 - License：GPL-3.0-only（详见 `LICENSE`）
+
+
+Pandadata 兼容维护：[abgyjaguo](https://github.com/abgyjaguo)，保留原项目作者署名。
